@@ -7,7 +7,9 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/main.js",
-    "dev": "tsc -p tsconfig.build.json --watch --preserveWatchOutput"
+    "dev": "pnpm run build && concurrently --kill-others-on-fail \"pnpm run dev:build\" \"pnpm run dev:server\"",
+    "dev:build": "tsc -p tsconfig.build.json --watch --preserveWatchOutput",
+    "dev:server": "node --watch dist/main.js"
   },
   "dependencies": {
     "@nestjs/common": "^11.0.1",
@@ -17,6 +19,7 @@
     "rxjs": "^7.8.1"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0"
+    "@types/node": "^24.0.0",
+    "concurrently": "^10.0.3"
   }
 }
