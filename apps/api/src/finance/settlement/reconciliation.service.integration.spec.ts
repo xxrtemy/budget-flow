@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { sql, type Kysely, type Transaction } from 'kysely';
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest';
 
@@ -108,6 +108,64 @@ describe('ReconciliationService', () => {
     });
     expect(closerCalls).toEqual([fixture.userId, fixture.userId]);
   });
+
+  test('serializes a category and budget creation chain behind the reconciliation profile prefix', async () => {
+    const userId = await createProfile();
+    const enteredCloser = deferred<void>();
+    const releaseCloser = deferred<void>();
+    const noOpBudgets = { async reconcileOpenPeriods() {} } as unknown as BudgetService;
+    const noOpObligations = {
+      async reserveOpenPeriods() {}, async applyDue() {},
+    } as unknown as ObligationService;
+    const noOpIncomes = { async materializeAndApplyDue() {} } as unknown as IncomeService;
+    const closer: PeriodCloser = {
+      async closeDuePeriods() {
+        enteredCloser.resolve();
+        await releaseCloser.promise;
+      },
+    };
+    const reconciliation = new ReconciliationService(
+      database(), noOpBudgets, noOpObligations, noOpIncomes, closer,
+    ).reconcileUser(userId, RECONCILE_AT);
+    await enteredCloser.promise;
+
+    const creation = new CategoryService(database()).create(userId, 'Late category')
+      .then((category) => new BudgetService(database()).create({
+        userId,
+        categoryId: category.id,
+        amountMinor: 1_000,
+        startsOn: '2026-01-20',
+        cadence: 'MONTHLY',
+      }));
+    const state = await settlementState(creation);
+    releaseCloser.resolve();
+    await expect(Promise.all([reconciliation, creation])).resolves.toHaveLength(2);
+    expect(state).toBe('blocked');
+    expect(await countFinancialAccounts(userId, 'BUDGET_RESERVE')).toBe(1);
+  });
+
+  test('category and budget creators hide a missing financial profile with 404', async () => {
+    const missingUserId = randomUUID();
+    await expect(new CategoryService(database()).create(missingUserId, 'Orphan'))
+      .rejects.toBeInstanceOf(NotFoundException);
+    expect(await categoryCount(missingUserId)).toBe(0);
+
+    const categoryId = randomUUID();
+    await database().insertInto('categories').values({
+      id: categoryId,
+      user_id: missingUserId,
+      name: 'Forged orphan',
+      archived_at: null,
+    }).execute();
+    await expect(new BudgetService(database()).create({
+      userId: missingUserId,
+      categoryId,
+      amountMinor: 1_000,
+      startsOn: '2026-01-20',
+      cadence: 'MONTHLY',
+    })).rejects.toBeInstanceOf(NotFoundException);
+    expect(await countFinancialAccounts(missingUserId, 'BUDGET_RESERVE')).toBe(0);
+  });
 });
 
 function reconciliationService(closer: PeriodCloser): ReconciliationService {
@@ -212,6 +270,37 @@ async function transactionCount(userId: string, type: string): Promise<number> {
     .select(sql<string>`count(*)`.as('count')).where('user_id', '=', userId)
     .where('type', '=', type).executeTakeFirstOrThrow();
   return Number(row.count);
+}
+
+async function countFinancialAccounts(userId: string, kind: 'BUDGET_RESERVE'): Promise<number> {
+  const row = await database().selectFrom('financial_accounts')
+    .select(sql<string>`count(*)`.as('count')).where('user_id', '=', userId)
+    .where('kind', '=', kind).executeTakeFirstOrThrow();
+  return Number(row.count);
+}
+
+async function categoryCount(userId: string): Promise<number> {
+  const row = await database().selectFrom('categories')
+    .select(sql<string>`count(*)`.as('count')).where('user_id', '=', userId)
+    .executeTakeFirstOrThrow();
+  return Number(row.count);
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+async function settlementState(promise: Promise<unknown>): Promise<'blocked' | 'settled'> {
+  return Promise.race([
+    promise.then(() => 'settled' as const, () => 'settled' as const),
+    new Promise<'blocked'>((resolve) => setTimeout(() => resolve('blocked'), 100)),
+  ]);
 }
 
 function database(): Kysely<Database> {

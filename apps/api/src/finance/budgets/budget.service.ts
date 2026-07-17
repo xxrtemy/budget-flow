@@ -85,6 +85,9 @@ export class BudgetService {
     validateCadence(input.cadence);
 
     return this.db.transaction().execute(async (trx) => {
+      const profile = await trx.selectFrom('financial_profiles').select('user_id')
+        .where('user_id', '=', input.userId).forUpdate().executeTakeFirst();
+      if (!profile) throw new NotFoundException('Financial profile not found');
       await lockActiveCategory(input.userId, input.categoryId, trx);
       const id = randomUUID();
       const reserveAccountId = randomUUID();

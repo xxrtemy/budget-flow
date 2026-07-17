@@ -37,13 +37,18 @@ export class CategoryService {
 
   async create(userId: string, name: string): Promise<Category> {
     const normalizedName = validateName(name);
-    const row = await this.db.insertInto('categories').values({
-      id: randomUUID(),
-      user_id: userId,
-      name: normalizedName,
-      archived_at: null,
-    }).returningAll().executeTakeFirstOrThrow();
-    return toCategory(row);
+    return this.db.transaction().execute(async (trx) => {
+      const profile = await trx.selectFrom('financial_profiles').select('user_id')
+        .where('user_id', '=', userId).forUpdate().executeTakeFirst();
+      if (!profile) throw new NotFoundException('Financial profile not found');
+      const row = await trx.insertInto('categories').values({
+        id: randomUUID(),
+        user_id: userId,
+        name: normalizedName,
+        archived_at: null,
+      }).returningAll().executeTakeFirstOrThrow();
+      return toCategory(row);
+    });
   }
 
   async list(userId: string, cursor?: string): Promise<{

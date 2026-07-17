@@ -24,6 +24,38 @@ beforeEach(async () => { await context?.reset(); });
 afterAll(async () => { await context?.close(); });
 
 describe('ObligationService', () => {
+  test('never backfills dates before initial creation during later reconciliation', async () => {
+    const userId = await createProfile();
+    const createdAt = new Date('2026-01-10T12:00:00.000Z');
+    const service = obligationService(() => createdAt);
+    const schedule = await service.create({
+      userId, amountMinor: 1_000, startsOn: '2026-01-08', cadence: 'DAILY', name: 'Meals',
+    });
+    const periodId = await currentPeriodId(userId);
+
+    await service.reservePeriod(userId, periodId, new Date('2026-01-20T12:00:00.000Z'));
+    await service.reservePeriod(userId, periodId, new Date('2026-01-20T12:00:00.000Z'));
+    await service.applyDue(userId, new Date('2026-01-20T12:00:00.000Z'));
+
+    const occurrences = (await service.listOccurrences(userId, schedule.id)).items;
+    expect(occurrences.every(({ dueAt }) => dueAt >= createdAt)).toBe(true);
+    expect(occurrences.some(({ occurrenceOn }) => occurrenceOn <= '2026-01-10')).toBe(false);
+  });
+
+  test('reserves an occurrence whose due instant equals initial creation time', async () => {
+    const userId = await createProfile('UTC');
+    const createdAt = new Date('2026-01-02T00:00:00.000Z');
+    const service = obligationService(() => createdAt);
+
+    const schedule = await service.create({
+      userId, amountMinor: 2_000, startsOn: '2026-01-02', cadence: 'MONTHLY', name: 'Exact',
+    });
+
+    expect((await service.listOccurrences(userId, schedule.id)).items).toEqual([
+      expect.objectContaining({ occurrenceOn: '2026-01-02', status: 'RESERVED' }),
+    ]);
+  });
+
   test('create reserves only future occurrences in the open period and may make FREE negative', async () => {
     const userId = await createProfile();
     const service = obligationService(() => COMMAND_NOW);
@@ -133,6 +165,26 @@ describe('ObligationService', () => {
     expect(releaseAmount).toBe(10_000);
   });
 
+  test('future open-period occurrences introduced by an update use the new amount', async () => {
+    const userId = await createProfile();
+    const service = obligationService(() => PROFILE_NOW);
+    const schedule = await service.create({
+      userId, amountMinor: 10_000, startsOn: '2026-01-15', cadence: 'MONTHLY', name: 'Internet',
+    });
+    await insertOpenPeriod(
+      userId,
+      '2026-01-31T21:00:00.000Z',
+      '2026-02-28T21:00:00.000Z',
+      '2026-02-28',
+    );
+    const updater = obligationService(() => new Date('2026-01-10T12:00:00.000Z'));
+
+    await updater.updateFuture(userId, schedule.id, { amountMinor: 99_000 });
+
+    await expect(reservedAmountForOccurrence(userId, schedule.id, '2026-01-15')).resolves.toBe(10_000);
+    await expect(reservedAmountForOccurrence(userId, schedule.id, '2026-02-15')).resolves.toBe(99_000);
+  });
+
   test('recurrence and timezone updates do not create alternative historical duplicates', async () => {
     const userId = await createProfile('Europe/Moscow');
     const service = obligationService(() => new Date('2026-01-10T12:00:00.000Z'));
@@ -153,7 +205,9 @@ describe('ObligationService', () => {
 
     const occurrenceOns = (await service.listOccurrences(userId, schedule.id)).items
       .map(({ occurrenceOn }) => occurrenceOn);
-    expect(occurrenceOns.filter((date) => date <= '2026-01-10')).toEqual(['2026-01-08']);
+    expect(occurrenceOns.filter((date) => date <= '2026-01-10')).toEqual([]);
+    expect(occurrenceOns.filter((date) => date === '2026-01-15')).toHaveLength(1);
+    expect(occurrenceOns.filter((date) => date === '2026-01-16')).toHaveLength(1);
     expect(new Set(occurrenceOns).size).toBe(occurrenceOns.length);
   });
 
@@ -180,6 +234,40 @@ describe('ObligationService', () => {
     expect(await transactionCount(userId, 'OBLIGATION_RESERVATION')).toBe(1);
     expect((await transactionCount(userId, 'OBLIGATION_PAYMENT'))
       + (await transactionCount(userId, 'OBLIGATION_RELEASE'))).toBe(1);
+  });
+
+  test('pays into a technical expense sink whose lifetime balance exceeds MAX_SAFE_INTEGER', async () => {
+    const userId = await createProfile();
+    const service = obligationService(() => PROFILE_NOW);
+    await service.create({
+      userId, amountMinor: 100, startsOn: '2026-01-02', cadence: 'MONTHLY', name: 'Rent',
+    });
+    const accounts = await database().selectFrom('financial_accounts').select(['id', 'kind'])
+      .where('user_id', '=', userId).where('kind', 'in', ['INCOME_SOURCE', 'EXPENSE_SINK'])
+      .execute();
+    const sourceId = accounts.find(({ kind }) => kind === 'INCOME_SOURCE')!.id;
+    const sinkId = accounts.find(({ kind }) => kind === 'EXPENSE_SINK')!.id;
+    const ledger = new LedgerService(database());
+    await ledger.post({
+      userId, type: 'ORDINARY_EXPENSE', effectiveAt: PROFILE_NOW,
+      postings: [
+        { accountId: sourceId, amountMinor: -Number.MAX_SAFE_INTEGER },
+        { accountId: sinkId, amountMinor: Number.MAX_SAFE_INTEGER },
+      ],
+    });
+    await ledger.post({
+      userId, type: 'ORDINARY_EXPENSE', effectiveAt: PROFILE_NOW,
+      postings: [
+        { accountId: sourceId, amountMinor: -1 },
+        { accountId: sinkId, amountMinor: 1 },
+      ],
+    });
+
+    await service.applyDue(userId, new Date('2026-01-02T00:00:00.000Z'));
+
+    expect(await transactionCount(userId, 'OBLIGATION_PAYMENT')).toBe(1);
+    expect(await accountBalanceBigInt(userId, sinkId))
+      .toBe(BigInt(Number.MAX_SAFE_INTEGER) + 101n);
   });
 
   test('ledger failure rolls back schedule, occurrence and reservation atomically', async () => {
@@ -275,6 +363,35 @@ async function postingAmount(userId: string, type: string, kind: AccountKind): P
     .where('ledger_transactions.type', '=', type).where('financial_accounts.kind', '=', kind)
     .executeTakeFirstOrThrow();
   return Number(row.amount_minor);
+}
+
+async function reservedAmountForOccurrence(
+  userId: string,
+  scheduleId: string,
+  occurrenceOn: string,
+): Promise<number> {
+  const row = await database().selectFrom('schedule_occurrences')
+    .innerJoin('ledger_transactions', (join) => join
+      .onRef('ledger_transactions.id', '=', 'schedule_occurrences.reservation_transaction_id')
+      .onRef('ledger_transactions.source_occurrence_id', '=', 'schedule_occurrences.id'))
+    .innerJoin('ledger_postings', 'ledger_postings.transaction_id', 'ledger_transactions.id')
+    .innerJoin('financial_accounts', 'financial_accounts.id', 'ledger_postings.account_id')
+    .select('ledger_postings.amount_minor')
+    .where('schedule_occurrences.user_id', '=', userId)
+    .where('schedule_occurrences.schedule_id', '=', scheduleId)
+    .where(sql<boolean>`ledger_transactions.metadata ->> 'occurrenceOn' = ${occurrenceOn}`)
+    .where('financial_accounts.kind', '=', 'OBLIGATION_RESERVE')
+    .where('ledger_postings.amount_minor', '>', sql<never>`0`)
+    .executeTakeFirstOrThrow();
+  return Number(row.amount_minor);
+}
+
+async function accountBalanceBigInt(userId: string, accountId: string): Promise<bigint> {
+  const row = await database().selectFrom('ledger_postings')
+    .select(sql<string>`coalesce(sum(amount_minor), 0)`.as('balance'))
+    .where('user_id', '=', userId).where('account_id', '=', accountId)
+    .executeTakeFirstOrThrow();
+  return BigInt(row.balance);
 }
 
 async function rowCount(table: 'obligation_schedules' | 'schedule_occurrences', userId: string): Promise<number> {

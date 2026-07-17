@@ -79,6 +79,12 @@ interface ReservationCandidate {
   dueAt: Date;
 }
 
+interface CandidateWindow {
+  lowerAt: Date;
+  lowerInclusive: boolean;
+  upperInclusive?: Date;
+}
+
 @Injectable()
 export class ObligationService {
   private readonly repository: ObligationRepository;
@@ -117,7 +123,6 @@ export class ObligationService {
         periods,
         occurrenceOns,
         trx,
-        commandTime,
       );
       await this.reserveCandidates(input.userId, candidates, commandTime, trx);
       return toSchedule(schedule);
@@ -161,18 +166,30 @@ export class ObligationService {
       const existingOns = await this.repository.loadOccurrenceOns(userId, [id], trx);
       const dates = existingOns.get(id) ?? new Set<string>();
       existingOns.set(id, dates);
-
-      const oldCandidates = await this.createCandidates(
-        userId, [existing], periods, existingOns, trx,
-      );
       const commandTime = validClock(this.clock());
       const boundary = new Date(Math.max(commandTime.getTime(), existing.updated_at.getTime() + 1));
+      const oldCandidates = await this.createCandidates(
+        userId,
+        [existing],
+        periods,
+        existingOns,
+        trx,
+        {
+          ...currentVersionWindow(existing),
+          upperInclusive: boundary,
+        },
+      );
       const updated = await this.repository.updateSchedule(userId, id, {
         ...normalized,
         updatedAt: boundary,
       }, trx);
       const newCandidates = await this.createCandidates(
-        userId, [updated], periods, existingOns, trx, boundary,
+        userId,
+        [updated],
+        periods,
+        existingOns,
+        trx,
+        { lowerAt: boundary, lowerInclusive: false },
       );
       await this.reserveCandidates(
         userId,
@@ -229,9 +246,7 @@ export class ObligationService {
       const details = await this.repository.reservationDetails(userId, [occurrence], trx);
       const detail = details.get(occurrence.id);
       if (!detail) throw new Error('Obligation reservation is missing');
-      const { freeId, reserveId } = await this.lockAccountSet(
-        userId, ['FREE', 'OBLIGATION_RESERVE'], trx,
-      );
+      const { freeId, reserveId } = await this.lockAccountSet(userId, trx);
       await this.ledger.post({
         userId,
         type: 'OBLIGATION_RELEASE',
@@ -313,9 +328,7 @@ export class ObligationService {
       )).filter(({ status, due_at }) => status === 'RESERVED' && due_at <= through);
       if (occurrences.length === 0) return;
       const details = await this.repository.reservationDetails(userId, occurrences, transaction);
-      const { reserveId, sinkId } = await this.lockAccountSet(
-        userId, ['OBLIGATION_RESERVE', 'EXPENSE_SINK'], transaction,
-      );
+      const { reserveId, sinkId } = await this.lockAccountSet(userId, transaction);
       for (const occurrence of occurrences) {
         const detail = details.get(occurrence.id);
         if (!detail) throw new Error('Obligation reservation is missing');
@@ -348,14 +361,11 @@ export class ObligationService {
     periods: readonly ObligationPeriodRow[],
     existingOns: Map<string, Set<string>>,
     trx: Transaction<Database>,
-    afterExclusive?: Date,
+    explicitWindow?: CandidateWindow,
   ): Promise<ReservationCandidate[]> {
     const candidates: ReservationCandidate[] = [];
     for (const schedule of schedules) {
-      const scheduleBoundary = afterExclusive
-        ?? (schedule.updated_at.getTime() === schedule.created_at.getTime()
-          ? undefined
-          : schedule.updated_at);
+      const window = explicitWindow ?? currentVersionWindow(schedule);
       const known = existingOns.get(schedule.id) ?? new Set<string>();
       existingOns.set(schedule.id, known);
       for (const period of periods) {
@@ -367,7 +377,10 @@ export class ObligationService {
           if (known.has(occurrenceOn)) continue;
           const dueAt = localDateToInstant(occurrenceOn, period.timezone);
           if (dueAt < period.starts_at || dueAt >= period.ends_at_exclusive) continue;
-          if (scheduleBoundary && dueAt <= scheduleBoundary) continue;
+          if (dueAt < window.lowerAt || (!window.lowerInclusive && dueAt <= window.lowerAt)) {
+            continue;
+          }
+          if (window.upperInclusive && dueAt > window.upperInclusive) continue;
           const occurrenceId = randomUUID();
           const inserted = await trx.insertInto('schedule_occurrences').values({
             id: occurrenceId,
@@ -405,9 +418,7 @@ export class ObligationService {
     trx: Transaction<Database>,
   ): Promise<void> {
     if (candidates.length === 0) return;
-    const { freeId, reserveId } = await this.lockAccountSet(
-      userId, ['FREE', 'OBLIGATION_RESERVE'], trx,
-    );
+    const { freeId, reserveId } = await this.lockAccountSet(userId, trx);
     for (const candidate of candidates) {
       const reservation = await this.ledger.post({
         userId,
@@ -435,19 +446,20 @@ export class ObligationService {
 
   private async lockAccountSet(
     userId: string,
-    kinds: readonly ('FREE' | 'OBLIGATION_RESERVE' | 'EXPENSE_SINK')[],
     trx: Transaction<Database>,
   ): Promise<{ freeId: string; reserveId: string; sinkId: string }> {
-    const identities = await this.accounts.findByKinds(userId, kinds, trx);
-    const freeId = identities.find(({ kind }) => kind === 'FREE')?.id ?? '';
-    const reserveId = identities.find(({ kind }) => kind === 'OBLIGATION_RESERVE')?.id ?? '';
-    const sinkId = identities.find(({ kind }) => kind === 'EXPENSE_SINK')?.id ?? '';
-    if ((kinds.includes('FREE') && !freeId)
-      || (kinds.includes('OBLIGATION_RESERVE') && !reserveId)
-      || (kinds.includes('EXPENSE_SINK') && !sinkId)) {
+    const identities = await this.accounts.findByKinds(
+      userId,
+      ['FREE', 'OBLIGATION_RESERVE', 'EXPENSE_SINK'],
+      trx,
+    );
+    const freeId = identities.find(({ kind }) => kind === 'FREE')?.id;
+    const reserveId = identities.find(({ kind }) => kind === 'OBLIGATION_RESERVE')?.id;
+    const sinkId = identities.find(({ kind }) => kind === 'EXPENSE_SINK')?.id;
+    if (!freeId || !reserveId || !sinkId) {
       throw new NotFoundException('Financial profile not found');
     }
-    await this.accounts.lockAccounts(userId, identities.map(({ id }) => id), trx);
+    await this.accounts.lockPostingAccounts(userId, identities.map(({ id }) => id), trx);
     return { freeId, reserveId, sinkId };
   }
 
@@ -553,6 +565,14 @@ function parseMoney(value: string): number {
     throw new Error('Stored obligation amount exceeds the safe integer range');
   }
   return parsed;
+}
+
+function currentVersionWindow(schedule: ObligationScheduleRow): CandidateWindow {
+  const initialVersion = schedule.updated_at.getTime() === schedule.created_at.getTime();
+  return {
+    lowerAt: initialVersion ? schedule.created_at : schedule.updated_at,
+    lowerInclusive: initialVersion,
+  };
 }
 
 function periodRange(period: ObligationPeriodRow): { startsOn: string; endsOnExclusive: string } {
