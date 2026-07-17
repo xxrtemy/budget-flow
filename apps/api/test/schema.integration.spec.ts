@@ -17,8 +17,8 @@ test('creates exactly the domain and required Kysely migration tables', async ()
   expect(rows.map(({ table_name }) => table_name).sort()).toEqual([
     'budget_allocations', 'budget_plans', 'calculation_periods', 'categories',
     'financial_accounts', 'financial_profiles', 'idempotency_records',
-    'income_schedules', 'ledger_postings', 'ledger_transactions',
-    'kysely_migration', 'kysely_migration_lock',
+    'income_schedules', 'kysely_migration', 'kysely_migration_lock',
+    'ledger_postings', 'ledger_transactions',
     'obligation_schedules', 'schedule_occurrences', 'settlement_offers',
   ]);
 });
