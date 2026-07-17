@@ -87,18 +87,10 @@ function toCalculationPeriod(row: PeriodRow): CalculationPeriod {
     userId: row.user_id,
     startsAt: row.starts_at,
     endsAtExclusive: row.ends_at_exclusive,
-    endsOnLocal: toDateOnly(row.ends_on_local),
+    endsOnLocal: row.ends_on_local,
     timezone: row.timezone,
     status: row.status,
     closedAt: row.closed_at,
     createdAt: row.created_at,
   };
-}
-
-function toDateOnly(value: string): string {
-  const runtimeValue = value as unknown;
-  if (runtimeValue instanceof Date) {
-    return DateTime.fromJSDate(runtimeValue).toISODate()!;
-  }
-  return value;
 }
