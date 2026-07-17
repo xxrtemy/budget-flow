@@ -13,6 +13,7 @@ import { IncomeService } from '../income/income.service';
 import { ObligationService } from '../obligations/obligation.service';
 
 export const PERIOD_CLOSER = Symbol('PERIOD_CLOSER');
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface PeriodCloser {
   closeDuePeriods(userId: string, now: Date, trx: Transaction<Database>): Promise<void>;
@@ -29,6 +30,9 @@ export class ReconciliationService {
   ) {}
 
   async reconcileUser(userId: string, now: Date): Promise<void> {
+    if (typeof userId !== 'string' || !UUID_PATTERN.test(userId)) {
+      throw new BadRequestException('userId must be a valid UUID');
+    }
     if (!(now instanceof Date) || Number.isNaN(now.getTime())) {
       throw new BadRequestException('now must be a valid Date');
     }

@@ -69,6 +69,90 @@ describe('SettlementService', () => {
     expect((await currentPeriod(userId)).starts_at).toEqual(period.ends_at_exclusive);
   });
 
+  test('releases every positive active reserve even when the current period has no allocation', async () => {
+    const userId = await createProfile();
+    const firstPeriod = await currentPeriod(userId);
+    const accounts = await accountIds(userId);
+    const plans = [];
+    for (const [name, amountMinor] of [['Food', 30_000], ['Transport', 20_000]] as const) {
+      const category = await new CategoryService(database()).create(userId, name);
+      const plan = await new BudgetService(database()).create({
+        userId, categoryId: category.id, amountMinor,
+        startsOn: '2026-01-01', cadence: 'ANNUAL',
+      });
+      await database().updateTable('budget_plans').set({
+        created_at: PROFILE_NOW, updated_at: PROFILE_NOW,
+      }).where('user_id', '=', userId).where('id', '=', plan.id).execute();
+      plans.push({ plan, amountMinor });
+    }
+    await post(userId, 'INCOME', new Date('2026-01-05T10:00:00Z'), [
+      [accounts.INCOME_SOURCE, -50_000], [accounts.FREE, 50_000],
+    ]);
+    await new BudgetService(database()).reconcilePeriod(userId, firstPeriod.id, PROFILE_NOW);
+    const expenses = [];
+    for (const { plan, amountMinor } of plans) {
+      expenses.push(await post(userId, 'ORDINARY_EXPENSE', new Date('2026-01-20T10:00:00Z'), [
+        [plan.reserveAccountId, -amountMinor], [accounts.EXPENSE_SINK, amountMinor],
+      ]));
+    }
+    await settlement().closeDuePeriods(userId, CLOSE_AT);
+    const secondPeriod = await currentPeriod(userId);
+    for (const expense of expenses) {
+      await new LedgerService(database()).reverse(
+        userId,
+        expense.id,
+        new Date('2026-02-15T10:00:00Z'),
+      );
+    }
+    expect(await database().selectFrom('budget_allocations').select('id')
+      .where('user_id', '=', userId).where('period_id', '=', secondPeriod.id).execute())
+      .toHaveLength(0);
+
+    await settlement().closeDuePeriods(userId, new Date('2026-03-01T12:00:00Z'));
+
+    expect(await balance(userId, accounts.FREE)).toBe(50_000n);
+    for (const { plan } of plans) {
+      expect(await balance(userId, plan.reserveAccountId)).toBe(0n);
+    }
+    expect(BigInt((await pendingOffer(userId)).offered_amount_minor)).toBe(50_000n);
+    const releases = await database().selectFrom('ledger_transactions').select('id')
+      .where('user_id', '=', userId).where('type', '=', 'BUDGET_RELEASE')
+      .where('effective_at', '=', new Date('2026-03-01T12:00:00Z')).execute();
+    expect(releases).toHaveLength(2);
+  });
+
+  test('waits for an eligible posting lock before taking the standalone close snapshot', async () => {
+    const userId = await createProfile();
+    const accounts = await accountIds(userId);
+    const locked = deferred<void>();
+    const postNow = deferred<void>();
+    const posting = database().transaction().execute(async (trx) => {
+      await trx.selectFrom('financial_accounts').select('id')
+        .where('user_id', '=', userId).where('id', '=', accounts.FREE)
+        .forUpdate().executeTakeFirstOrThrow();
+      locked.resolve();
+      await postNow.promise;
+      await new LedgerService(database()).post({
+        userId, type: 'INCOME', effectiveAt: new Date('2026-01-20T10:00:00Z'),
+        postings: [
+          { accountId: accounts.INCOME_SOURCE, amountMinor: -40_000 },
+          { accountId: accounts.FREE, amountMinor: 40_000 },
+        ],
+      }, trx);
+    });
+    await locked.promise;
+    const closing = settlement().closeDuePeriods(userId, CLOSE_AT);
+    try {
+      await waitForBlockedRowLocks('financial_accounts', 1);
+    } finally {
+      postNow.resolve();
+      await posting;
+    }
+    await closing;
+
+    expect(BigInt((await pendingOffer(userId)).offered_amount_minor)).toBe(40_000n);
+  });
+
   test('counts only cash transaction types and eligible reversals at their own effective time', async () => {
     const userId = await createProfile();
     const accounts = await accountIds(userId);
@@ -104,6 +188,21 @@ describe('SettlementService', () => {
       expect(await database().selectFrom('settlement_offers').select('id')
         .where('user_id', '=', userId).execute()).toHaveLength(0);
     }
+  });
+
+  test('clamps a positive net cash result to FREE after excluded internal transfers', async () => {
+    const userId = await createProfile();
+    const accounts = await accountIds(userId);
+    await post(userId, 'INCOME', new Date('2026-01-10T10:00:00Z'), [
+      [accounts.INCOME_SOURCE, -100_000], [accounts.FREE, 100_000],
+    ]);
+    await post(userId, 'SAVINGS_TRANSFER', new Date('2026-01-20T10:00:00Z'), [
+      [accounts.FREE, -40_000], [accounts.SAVINGS_GENERAL, 40_000],
+    ]);
+
+    await settlement().closeDuePeriods(userId, CLOSE_AT);
+
+    expect(BigInt((await pendingOffer(userId)).offered_amount_minor)).toBe(60_000n);
   });
 
   test('uses the updated timezone and anchored profile end when opening the next period', async () => {
@@ -171,6 +270,72 @@ describe('SettlementService', () => {
     expect(await balance(userId, accounts.SAVINGS_GENERAL)).toBe(25_000n);
     await expect(settlement().acceptOffer({ userId, offerId: offer.id, acceptedAt: CLOSE_AT }))
       .rejects.toBeInstanceOf(ConflictException);
+  });
+
+  test('accepts the full offered amount when amountMinor is omitted', async () => {
+    const userId = await createProfile();
+    const accounts = await accountIds(userId);
+    await post(userId, 'INCOME', new Date('2026-01-10T10:00:00Z'), [
+      [accounts.INCOME_SOURCE, -50_000], [accounts.FREE, 50_000],
+    ]);
+    await settlement().closeDuePeriods(userId, CLOSE_AT);
+    const offer = await pendingOffer(userId);
+
+    const accepted = await settlement().acceptOffer({
+      userId, offerId: offer.id, acceptedAt: CLOSE_AT,
+    });
+
+    expect(accepted).toMatchObject({ status: 'ACCEPTED', acceptedAmountMinor: 50_000 });
+    expect(await balance(userId, accounts.FREE)).toBe(0n);
+    expect(await balance(userId, accounts.SAVINGS_GENERAL)).toBe(50_000n);
+  });
+
+  test('cursor-paginates both offer states without leaking another tenant', async () => {
+    const userId = await createProfile();
+    const otherUserId = await createProfile();
+    const periodRows = Array.from({ length: 51 }, (_, index) => ({
+      id: randomUUID(), user_id: userId,
+      starts_at: new Date(Date.UTC(2020, 0, 1 + index)),
+      ends_at_exclusive: new Date(Date.UTC(2020, 0, 2 + index)),
+      ends_on_local: new Date(Date.UTC(2020, 0, 1 + index)).toISOString().slice(0, 10),
+      timezone: 'Europe/Moscow', status: 'CLOSED' as const,
+      closed_at: new Date(Date.UTC(2020, 0, 2 + index)),
+    }));
+    await database().insertInto('calculation_periods').values(periodRows).execute();
+    const offerRows = periodRows.map((period, index) => ({
+      id: randomUUID(), user_id: userId, period_id: period.id,
+      offered_amount_minor: index + 1, accepted_amount_minor: null,
+      status: 'PENDING' as const,
+      accepted_at: null,
+      transfer_transaction_id: null,
+      created_at: new Date('2026-02-01T00:00:00Z'),
+    }));
+    await database().insertInto('settlement_offers').values(offerRows).execute();
+    const ownerAccounts = await accountIds(userId);
+    await post(userId, 'INCOME', CLOSE_AT, [
+      [ownerAccounts.INCOME_SOURCE, -1], [ownerAccounts.FREE, 1],
+    ]);
+    await settlement().acceptOffer({
+      userId, offerId: offerRows[0]!.id, amountMinor: 1, acceptedAt: CLOSE_AT,
+    });
+    const otherPeriod = await currentPeriod(otherUserId);
+    await database().insertInto('settlement_offers').values({
+      id: randomUUID(), user_id: otherUserId, period_id: otherPeriod.id,
+      offered_amount_minor: 999, accepted_amount_minor: null, status: 'PENDING',
+      accepted_at: null, transfer_transaction_id: null,
+    }).execute();
+
+    const first = await settlement().listOffers(userId);
+    const second = await settlement().listOffers(userId, first.nextCursor!);
+
+    expect(first.items).toHaveLength(50);
+    expect(first.nextCursor).not.toBeNull();
+    expect(second.items).toHaveLength(1);
+    expect(second.nextCursor).toBeNull();
+    expect(new Set([...first.items, ...second.items].map(({ id }) => id)))
+      .toEqual(new Set(offerRows.map(({ id }) => id)));
+    expect([...first.items, ...second.items].some(({ status }) => status === 'ACCEPTED')).toBe(true);
+    expect(first.items.every(({ userId: owner }) => owner === userId)).toBe(true);
   });
 
   test('serializes concurrent accept calls into one transfer and one conflict', async () => {
@@ -254,6 +419,9 @@ describe('SettlementService', () => {
       .rejects.toBeInstanceOf(BadRequestException);
     await expect(settlement().acceptOffer({ userId, offerId: offer.id, amountMinor: 0, acceptedAt: CLOSE_AT }))
       .rejects.toBeInstanceOf(BadRequestException);
+    await expect(settlement().acceptOffer({
+      userId, offerId: offer.id, amountMinor: 20_000, acceptedAt: CLOSE_AT,
+    })).rejects.toBeInstanceOf(BadRequestException);
     await expect(settlement().acceptOffer({ userId: otherUserId, offerId: offer.id, acceptedAt: CLOSE_AT }))
       .rejects.toBeInstanceOf(NotFoundException);
   });

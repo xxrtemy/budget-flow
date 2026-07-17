@@ -37,6 +37,12 @@ describe('ReconciliationService', () => {
       .rejects.toBeInstanceOf(BadRequestException);
   });
 
+  test('rejects a malformed user id before PostgreSQL UUID inference', async () => {
+    const service = reconciliationService({ async closeDuePeriods() {} });
+    await expect(service.reconcileUser('bad', RECONCILE_AT))
+      .rejects.toBeInstanceOf(BadRequestException);
+  });
+
   test('runs the exact orchestration order and invokes the closer in the same transaction', async () => {
     const userId = await createProfile();
     const calls: string[] = [];

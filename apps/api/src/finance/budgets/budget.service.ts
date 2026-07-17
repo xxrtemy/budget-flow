@@ -28,6 +28,7 @@ import {
   lockActiveCategory,
   lockAllActiveBudgetPlans,
   releaseAndArchiveBudgetPlans,
+  type LockedBudgetPlan,
 } from './budget-locking';
 
 const PAGE_SIZE = 50;
@@ -260,33 +261,22 @@ export class BudgetService {
     periodId: string,
     releasedAt: Date,
     trx: Transaction<Database>,
+    plans: readonly LockedBudgetPlan[],
   ): Promise<void> {
     validateDate(releasedAt, 'releasedAt');
-    const plans = await lockAllActiveBudgetPlans(userId, trx);
     if (plans.length === 0) return;
 
-    const allocations = await trx.selectFrom('budget_allocations')
-      .select(['id', 'budget_plan_id'])
-      .where('user_id', '=', userId)
-      .where('period_id', '=', periodId)
-      .where('released_transaction_id', 'is', null)
-      .where('budget_plan_id', 'in', plans.map(({ id }) => id))
-      .orderBy('id')
-      .forUpdate()
-      .execute();
-    const periodPlanIds = [...new Set(allocations.map(({ budget_plan_id }) => budget_plan_id))]
-      .sort();
-    if (periodPlanIds.length === 0) return;
+    const planIds = plans.map(({ id }) => id);
 
     const reserveAccounts = await trx.selectFrom('financial_accounts')
       .select(['id', 'reference_id'])
       .where('user_id', '=', userId)
       .where('kind', '=', 'BUDGET_RESERVE')
-      .where('reference_id', 'in', periodPlanIds)
+      .where('reference_id', 'in', planIds)
       .where('archived_at', 'is', null)
       .orderBy('id')
       .execute();
-    if (reserveAccounts.length !== periodPlanIds.length) {
+    if (reserveAccounts.length !== planIds.length) {
       throw new NotFoundException('Budget reserve account not found');
     }
     const freeAccount = await trx.selectFrom('financial_accounts').select('id')
@@ -301,7 +291,7 @@ export class BudgetService {
     );
     const balanceById = new Map(locked.map(({ id, balanceMinor }) => [id, balanceMinor]));
     const reserveByPlan = new Map(reserveAccounts.map(({ id, reference_id }) => [reference_id!, id]));
-    for (const planId of periodPlanIds) {
+    for (const planId of planIds) {
       const reserveId = reserveByPlan.get(planId)!;
       const remainder = balanceById.get(reserveId) ?? 0n;
       if (remainder <= 0n) continue;
@@ -324,6 +314,13 @@ export class BudgetService {
         .where('released_transaction_id', 'is', null)
         .execute();
     }
+  }
+
+  lockActivePlansForSettlement(
+    userId: string,
+    trx: Transaction<Database>,
+  ): Promise<LockedBudgetPlan[]> {
+    return lockAllActiveBudgetPlans(userId, trx);
   }
 
   private async reconcileInTransaction(

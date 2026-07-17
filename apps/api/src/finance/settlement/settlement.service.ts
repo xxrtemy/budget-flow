@@ -26,6 +26,9 @@ import type { PeriodCloser } from './reconciliation.service';
 
 const PAGE_SIZE = 50;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ASSET_ACCOUNT_KINDS = [
+  'FREE', 'OBLIGATION_RESERVE', 'BUDGET_RESERVE', 'SAVINGS_GENERAL', 'SAVINGS_GOAL',
+] as const;
 
 export interface SettlementOffer {
   id: string;
@@ -179,7 +182,9 @@ export class SettlementService implements PeriodCloser {
     if (!period) throw new NotFoundException('Current calculation period not found');
     if (period.ends_at_exclusive > now) return;
 
-    await this.budgets.releasePeriodRemainders(userId, period.id, now, trx);
+    const plans = await this.budgets.lockActivePlansForSettlement(userId, trx);
+    await this.lockCompleteAssetAccountSet(userId, trx);
+    await this.budgets.releasePeriodRemainders(userId, period.id, now, trx, plans);
     const netCashResult = await exactNetCashResult(userId, period.starts_at, period.ends_at_exclusive, trx);
     const [free] = await this.accounts.findByKinds(userId, ['FREE'], trx);
     if (!free) throw new NotFoundException('Financial profile not found');
@@ -214,6 +219,22 @@ export class SettlementService implements PeriodCloser {
       ),
       updated_at: now,
     }).where('user_id', '=', userId).execute();
+  }
+
+  private async lockCompleteAssetAccountSet(
+    userId: string,
+    trx: Transaction<Database>,
+  ): Promise<void> {
+    const accounts = await trx.selectFrom('financial_accounts').select('id')
+      .where('user_id', '=', userId)
+      .where('kind', 'in', [...ASSET_ACCOUNT_KINDS])
+      .orderBy('id')
+      .execute();
+    await this.accounts.lockPostingAccounts(
+      userId,
+      accounts.map(({ id }) => id),
+      trx,
+    );
   }
 }
 
