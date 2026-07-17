@@ -19,6 +19,9 @@ const NOW = new Date('2026-07-17T08:00:00.000Z');
 const BUDGET_UPDATE_LOCK_KEY = 41_004;
 const CATEGORY_ARCHIVE_LOCK_KEY = 41_005;
 const REVERSAL_INSERT_LOCK_KEY = 41_006;
+const ORDERED_SINK_ID = '00000000-0000-4000-8000-000000000001';
+const ORDERED_FREE_ID = '00000000-0000-4000-8000-000000000002';
+const ORDERED_RESERVE_ID = '00000000-0000-4000-8000-000000000003';
 
 let context: DatabaseTestContext | undefined;
 
@@ -130,6 +133,59 @@ describe('category budget expenses', () => {
         userId,
       },
     ]));
+  });
+
+  test('locks the complete expense posting set before a concurrent posting can invert account order', async () => {
+    const userId = await createUserWithoutOpeningBalance();
+    const category = await new CategoryService(database()).create(userId, 'Food');
+    const budget = budgetService();
+    const plan = await budget.create({
+      userId,
+      categoryId: category.id,
+      amountMinor: 500,
+      startsOn: '2026-07-17',
+      cadence: 'ANNUAL',
+    });
+    await setAccountId(userId, 'EXPENSE_SINK', ORDERED_SINK_ID);
+    await setAccountId(userId, 'FREE', ORDERED_FREE_ID);
+    await setAccountId(userId, 'BUDGET_RESERVE', ORDERED_RESERVE_ID, plan.id);
+    await new LedgerService(database()).createOpeningBalance(userId, 1_000, NOW);
+    await budget.reconcilePeriod(userId, await currentPeriodId(userId), NOW);
+    const blocker = await holdAccountLock(userId, ORDERED_RESERVE_ID);
+    const concurrent: Promise<unknown>[] = [];
+
+    try {
+      const expense = new ExpenseService(database()).create({
+        userId,
+        categoryId: category.id,
+        amountMinor: 100,
+        occurredAt: NOW,
+      });
+      concurrent.push(expense);
+      await waitForBlockedQueryCount('from "financial_accounts"', 1);
+      const directPosting = new LedgerService(database()).post({
+        userId,
+        type: 'BUDGET_RESERVATION',
+        effectiveAt: NOW,
+        postings: [
+          { accountId: ORDERED_SINK_ID, amountMinor: -1 },
+          { accountId: ORDERED_RESERVE_ID, amountMinor: 1 },
+        ],
+      });
+      concurrent.push(directPosting);
+      await waitForBlockedQueryCount('from "financial_accounts"', 2);
+      blocker.release();
+      await blocker.done;
+
+      await expect(Promise.all(concurrent)).resolves.toHaveLength(2);
+    } finally {
+      blocker.release();
+      await blocker.done;
+      await Promise.allSettled(concurrent);
+    }
+
+    await expect(accountBalance(userId, ORDERED_RESERVE_ID)).resolves.toBe(401);
+    await expect(transactionCount(userId, 'ORDINARY_EXPENSE')).resolves.toBe(1);
   });
 
   test('category pagination does not lose rows that share a millisecond', async () => {
@@ -641,14 +697,36 @@ function budgetService(): BudgetService {
 }
 
 async function createUserWithOpeningBalance(amountMinor: number): Promise<string> {
+  const userId = await createUserWithoutOpeningBalance();
+  await new LedgerService(database()).createOpeningBalance(userId, amountMinor, NOW);
+  return userId;
+}
+
+async function createUserWithoutOpeningBalance(): Promise<string> {
   const userId = randomUUID();
   await new ProfileService(new ProfileRepository(database()), () => NOW).upsert({
     userId,
     cadence: 'MONTHLY',
     firstPeriodEndsOn: '2026-07-31',
   });
-  await new LedgerService(database()).createOpeningBalance(userId, amountMinor, NOW);
   return userId;
+}
+
+async function setAccountId(
+  userId: string,
+  kind: 'FREE' | 'EXPENSE_SINK' | 'BUDGET_RESERVE',
+  id: string,
+  referenceId?: string,
+): Promise<void> {
+  let query = database().updateTable('financial_accounts')
+    .set({ id })
+    .where('user_id', '=', userId)
+    .where('kind', '=', kind);
+  if (referenceId) {
+    query = query.where('reference_id', '=', referenceId);
+  }
+  const result = await query.executeTakeFirst();
+  expect(Number(result.numUpdatedRows)).toBe(1);
 }
 
 async function currentPeriodId(userId: string): Promise<string> {
@@ -726,6 +804,34 @@ interface AdvisoryLockBlocker {
   done: Promise<void>;
 }
 
+async function holdAccountLock(userId: string, accountId: string): Promise<AdvisoryLockBlocker> {
+  let markReady!: () => void;
+  let releaseLock!: () => void;
+  let released = false;
+  const ready = new Promise<void>((resolve) => { markReady = resolve; });
+  const release = new Promise<void>((resolve) => { releaseLock = resolve; });
+  const done = database().transaction().execute(async (trx) => {
+    await trx.selectFrom('financial_accounts')
+      .select('id')
+      .where('user_id', '=', userId)
+      .where('id', '=', accountId)
+      .forUpdate()
+      .executeTakeFirstOrThrow();
+    markReady();
+    await release;
+  });
+  await ready;
+  return {
+    release(): void {
+      if (!released) {
+        released = true;
+        releaseLock();
+      }
+    },
+    done,
+  };
+}
+
 async function holdAdvisoryLock(key: number): Promise<AdvisoryLockBlocker> {
   let markReady!: () => void;
   let releaseLock!: () => void;
@@ -757,6 +863,10 @@ async function settlementState(promise: Promise<unknown>): Promise<'completed' |
 }
 
 async function waitForBlockedQuery(fragment: string): Promise<void> {
+  await waitForBlockedQueryCount(fragment, 1);
+}
+
+async function waitForBlockedQueryCount(fragment: string, expectedCount: number): Promise<void> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const result = await sql<{ count: string }>`
       select count(*)::text as count
@@ -765,12 +875,12 @@ async function waitForBlockedQuery(fragment: string): Promise<void> {
         and wait_event_type = 'Lock'
         and query like ${`%${fragment}%`}
     `.execute(database());
-    if (Number(result.rows[0]?.count ?? 0) > 0) {
+    if (Number(result.rows[0]?.count ?? 0) >= expectedCount) {
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
-  throw new Error(`Timed out waiting for blocked query: ${fragment}`);
+  throw new Error(`Timed out waiting for ${expectedCount} blocked queries: ${fragment}`);
 }
 
 async function installBudgetUpdateWaitTrigger(): Promise<void> {

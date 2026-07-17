@@ -86,32 +86,33 @@ export class ExpenseService {
         throw new NotFoundException('Financial profile not found');
       }
 
-      const locked = await this.accounts.lockAccounts(
+      const locked = await this.accounts.lockPostingAccounts(
         input.userId,
-        [freeId, ...reserveAccounts.map(({ id }) => id)],
+        [freeId, sinkId, ...reserveAccounts.map(({ id }) => id)],
         trx,
       );
       const balanceById = new Map(locked.map((account) => [
         account.id,
         account.balanceMinor,
       ]));
-      let remainingExpense = input.amountMinor;
+      let remainingExpense = BigInt(input.amountMinor);
       let remainingReserve = 0n;
       const reservePostings: Array<{ accountId: string; amountMinor: number }> = [];
       for (const account of reserveAccounts) {
-        const balance = Math.max(0, balanceById.get(account.id) ?? 0);
-        const consumed = Math.min(balance, remainingExpense);
-        if (consumed > 0) {
-          reservePostings.push({ accountId: account.id, amountMinor: -consumed });
+        const storedBalance = balanceById.get(account.id) ?? 0n;
+        const balance = storedBalance > 0n ? storedBalance : 0n;
+        const consumed = balance < remainingExpense ? balance : remainingExpense;
+        if (consumed > 0n) {
+          reservePostings.push({ accountId: account.id, amountMinor: -Number(consumed) });
           remainingExpense -= consumed;
         }
-        remainingReserve += BigInt(balance - consumed);
+        remainingReserve += balance - consumed;
       }
       const remainingReserveMinor = safeReserveAggregate(remainingReserve);
       const postings = [
         ...reservePostings,
-        ...(remainingExpense > 0
-          ? [{ accountId: freeId, amountMinor: -remainingExpense }]
+        ...(remainingExpense > 0n
+          ? [{ accountId: freeId, amountMinor: -Number(remainingExpense) }]
           : []),
         { accountId: sinkId, amountMinor: input.amountMinor },
       ];
