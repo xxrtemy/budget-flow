@@ -162,7 +162,7 @@ describe('IncomeService', () => {
 
   test('updates only future unmaterialized income and archive stops future materialization', async () => {
     const userId = await createProfile();
-    const service = incomeService();
+    const service = incomeService(() => new Date('2026-02-01T00:00:00.000Z'));
     const schedule = await service.createSchedule({
       userId,
       amountMinor: 100_000,
@@ -196,6 +196,130 @@ describe('IncomeService', () => {
     expect((await service.listSchedules(userId)).items).toEqual([]);
     await expect(recurringIncomeTransactions(userId)).resolves.toHaveLength(3);
   });
+
+  test('materializes missed old-rule income before changing cadence', async () => {
+    const userId = await createProfile();
+    const commandTime = new Date('2026-03-01T00:00:00.000Z');
+    const service = incomeService(() => commandTime);
+    const schedule = await service.createSchedule({
+      userId,
+      amountMinor: 100_000,
+      startsOn: '2026-01-31',
+      cadence: 'MONTHLY',
+      name: 'Salary',
+    });
+    await service.materializeAndApplyDue(userId, new Date('2026-01-30T21:00:00.000Z'));
+
+    await service.updateSchedule(userId, schedule.id, { cadence: 'QUARTERLY' });
+    await service.materializeAndApplyDue(userId, new Date('2026-04-29T21:00:00.000Z'));
+
+    await expect(recurringIncomeOccurrenceOns(userId)).resolves.toEqual([
+      '2026-01-31',
+      '2026-02-28',
+      '2026-04-30',
+    ]);
+  });
+
+  test('does not reinterpret past dates after changing startsOn and applies the next new-rule date', async () => {
+    const userId = await createProfile();
+    const commandTime = new Date('2026-04-01T00:00:00.000Z');
+    const service = incomeService(() => commandTime);
+    const schedule = await service.createSchedule({
+      userId,
+      amountMinor: 100_000,
+      startsOn: '2026-01-31',
+      cadence: 'MONTHLY',
+      name: 'Salary',
+    });
+    await service.materializeAndApplyDue(userId, new Date('2026-03-30T21:00:00.000Z'));
+
+    await service.updateSchedule(userId, schedule.id, { startsOn: '2026-01-30' });
+    await service.materializeAndApplyDue(userId, new Date('2026-04-29T21:00:00.000Z'));
+
+    await expect(recurringIncomeOccurrenceOns(userId)).resolves.toEqual([
+      '2026-01-31',
+      '2026-02-28',
+      '2026-03-31',
+      '2026-04-30',
+    ]);
+  });
+
+  test('deduplicates a local occurrence date after the profile timezone changes', async () => {
+    const userId = await createProfile('Europe/Moscow');
+    const service = incomeService();
+    await service.createSchedule({
+      userId,
+      amountMinor: 100_000,
+      startsOn: '2026-01-31',
+      cadence: 'MONTHLY',
+      name: 'Salary',
+    });
+    await service.materializeAndApplyDue(userId, new Date('2026-01-30T21:00:00.000Z'));
+    await new ProfileService(new ProfileRepository(database()), () => NOW).upsert({
+      userId,
+      timezone: 'UTC',
+      cadence: 'MONTHLY',
+      firstPeriodEndsOn: '2026-01-31',
+    });
+
+    await service.materializeAndApplyDue(userId, new Date('2026-01-31T00:00:00.000Z'));
+
+    await expect(recurringIncomeOccurrenceOns(userId)).resolves.toEqual(['2026-01-31']);
+    const occurrences = await database().selectFrom('schedule_occurrences')
+      .select(['due_at'])
+      .where('user_id', '=', userId)
+      .where('schedule_type', '=', 'INCOME')
+      .execute();
+    expect(occurrences).toEqual([{ due_at: new Date('2026-01-30T21:00:00.000Z') }]);
+  });
+
+  test('applies an already-due missed income before archiving its schedule', async () => {
+    const userId = await createProfile();
+    const service = incomeService(() => new Date('2026-02-01T00:00:00.000Z'));
+    const schedule = await service.createSchedule({
+      userId,
+      amountMinor: 100_000,
+      startsOn: '2026-01-31',
+      cadence: 'MONTHLY',
+      name: 'Salary',
+    });
+
+    await service.archiveSchedule(userId, schedule.id);
+
+    await expect(recurringIncomeOccurrenceOns(userId)).resolves.toEqual(['2026-01-31']);
+    await expect(service.getSchedule(userId, schedule.id)).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  test.each(['update', 'archive'] as const)(
+    'rolls back pre-%s materialization and the schedule mutation when ledger posting fails',
+    async (operation) => {
+      const userId = await createProfile();
+      const service = incomeService(() => new Date('2026-02-01T00:00:00.000Z'));
+      const schedule = await service.createSchedule({
+        userId,
+        amountMinor: 100_000,
+        startsOn: '2026-01-31',
+        cadence: 'MONTHLY',
+        name: 'Salary',
+      });
+
+      await installRecurringIncomeFailureTrigger();
+      try {
+        const mutation = operation === 'update'
+          ? service.updateSchedule(userId, schedule.id, { amountMinor: 120_000 })
+          : service.archiveSchedule(userId, schedule.id);
+        await expect(mutation).rejects.toThrow('injected recurring income failure');
+      } finally {
+        await dropRecurringIncomeFailureTrigger();
+      }
+
+      await expect(service.getSchedule(userId, schedule.id)).resolves.toMatchObject({
+        amountMinor: 100_000,
+        archivedAt: null,
+      });
+      await expect(recurringIncomeOccurrenceOns(userId)).resolves.toEqual([]);
+    },
+  );
 
   test('hides schedules and one-off incomes from another tenant', async () => {
     const ownerId = await createProfile();
@@ -342,8 +466,8 @@ describe('IncomeService', () => {
   });
 });
 
-function incomeService(): IncomeService {
-  return new IncomeService(database());
+function incomeService(clock?: () => Date): IncomeService {
+  return new IncomeService(database(), clock);
 }
 
 async function createProfile(timezone = 'Europe/Moscow'): Promise<string> {
@@ -384,6 +508,23 @@ async function recurringIncomeTransactions(userId: string): Promise<Array<{
     .where('financial_accounts.kind', '=', 'FREE')
     .orderBy('ledger_transactions.effective_at')
     .execute();
+}
+
+async function recurringIncomeOccurrenceOns(userId: string): Promise<string[]> {
+  const rows = await database().selectFrom('ledger_transactions')
+    .select('metadata')
+    .where('user_id', '=', userId)
+    .where('type', '=', 'INCOME')
+    .where('source_occurrence_id', 'is not', null)
+    .orderBy('effective_at')
+    .execute();
+  return rows.map(({ metadata }) => {
+    const occurrenceOn = (metadata as Record<string, unknown>).occurrenceOn;
+    if (typeof occurrenceOn !== 'string') {
+      throw new Error('Recurring income metadata is missing occurrenceOn');
+    }
+    return occurrenceOn;
+  });
 }
 
 async function installRecurringIncomeFailureTrigger(): Promise<void> {

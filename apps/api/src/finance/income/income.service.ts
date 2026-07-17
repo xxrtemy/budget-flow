@@ -218,35 +218,53 @@ export class IncomeService {
       validateCadence(patch.cadence);
     }
     const name = patch.name === undefined ? undefined : validateName(patch.name);
+    const commandTime = this.clock();
+    validateDate(commandTime, 'clock');
 
     return this.db.transaction().execute(async (trx) => {
-      await this.requireProfileLock(userId, trx);
+      const profile = await this.requireProfileLock(userId, trx);
       const existing = await this.repository.lockActiveSchedule(userId, id, trx);
       if (!existing) {
         throw new NotFoundException('Income schedule not found');
       }
+      await this.applySchedulesDue(
+        userId,
+        profile.timezone,
+        [existing],
+        commandTime,
+        trx,
+      );
       const row = await this.repository.updateSchedule(userId, id, {
         amountMinor: patch.amountMinor,
         startsOn: patch.startsOn,
         cadence: patch.cadence,
         name,
-        updatedAt: this.clock(),
+        updatedAt: commandTime,
       }, trx);
       return toIncomeSchedule(row);
     });
   }
 
   async archiveSchedule(userId: string, id: string): Promise<void> {
+    const commandTime = this.clock();
+    validateDate(commandTime, 'clock');
     await this.db.transaction().execute(async (trx) => {
-      await this.requireProfileLock(userId, trx);
+      const profile = await this.requireProfileLock(userId, trx);
       const existing = await this.repository.lockActiveSchedule(userId, id, trx);
       if (!existing) {
         throw new NotFoundException('Income schedule not found');
       }
+      await this.applySchedulesDue(
+        userId,
+        profile.timezone,
+        [existing],
+        commandTime,
+        trx,
+      );
       const archived = await this.repository.archiveSchedule(
         userId,
         id,
-        this.clock(),
+        commandTime,
         trx,
       );
       if (!archived) {
@@ -275,13 +293,23 @@ export class IncomeService {
     trx: Transaction<Database>,
   ): Promise<void> {
     const profile = await this.requireProfileLock(userId, trx);
-    const throughLocal = DateTime.fromJSDate(through, { zone: profile.timezone });
-    if (!throughLocal.isValid) {
-      throw new BadRequestException('Financial profile has an invalid timezone');
-    }
     const schedules = await this.repository.lockActiveSchedules(userId, trx);
+    await this.applySchedulesDue(userId, profile.timezone, schedules, through, trx);
+  }
+
+  private async applySchedulesDue(
+    userId: string,
+    timezone: string,
+    schedules: readonly IncomeScheduleRow[],
+    through: Date,
+    trx: Transaction<Database>,
+  ): Promise<void> {
     if (schedules.length === 0) {
       return;
+    }
+    const throughLocal = DateTime.fromJSDate(through, { zone: timezone });
+    if (!throughLocal.isValid) {
+      throw new BadRequestException('Financial profile has an invalid timezone');
     }
     const accounts = await this.accounts.findByKinds(
       userId,
@@ -305,8 +333,19 @@ export class IncomeService {
       });
       const amountMinor = parseMoney(schedule.amount_minor);
       for (const occurrenceOn of occurrenceDates) {
-        const dueAt = localDateToInstant(occurrenceOn, profile.timezone);
+        const dueAt = localDateToInstant(occurrenceOn, timezone);
         if (dueAt.getTime() > through.getTime()) {
+          continue;
+        }
+        if (wasUpdated(schedule) && dueAt.getTime() <= schedule.updated_at.getTime()) {
+          continue;
+        }
+        if (await this.repository.hasAppliedLocalOccurrence(
+          userId,
+          schedule.id,
+          occurrenceOn,
+          trx,
+        )) {
           continue;
         }
 
@@ -420,6 +459,10 @@ function toIncomeSchedule(row: IncomeScheduleRow): IncomeSchedule {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function wasUpdated(row: IncomeScheduleRow): boolean {
+  return row.updated_at.getTime() !== row.created_at.getTime();
 }
 
 function validateAmount(value: number): void {

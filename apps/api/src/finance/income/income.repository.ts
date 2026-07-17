@@ -203,4 +203,21 @@ export class IncomeRepository {
       .limit(limit)
       .execute();
   }
+
+  async hasAppliedLocalOccurrence(
+    userId: string,
+    scheduleId: string,
+    occurrenceOn: string,
+    executor: DatabaseExecutor,
+  ): Promise<boolean> {
+    const row = await executor.selectFrom('ledger_transactions')
+      .select('id')
+      .where('user_id', '=', userId)
+      .where('type', '=', 'INCOME')
+      .where('source_occurrence_id', 'is not', null)
+      .where(sql<boolean>`metadata ->> 'incomeScheduleId' = ${scheduleId}`)
+      .where(sql<boolean>`metadata ->> 'occurrenceOn' = ${occurrenceOn}`)
+      .executeTakeFirst();
+    return Boolean(row);
+  }
 }
