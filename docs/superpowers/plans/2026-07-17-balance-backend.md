@@ -426,7 +426,7 @@ export class LedgerService {
 }
 ```
 
-Validate at least two non-zero postings, a zero sum, account ownership, safe integer values, and allowed negative balances. Insert the transaction and all postings in the same DB transaction.
+Validate at least two non-zero postings, a zero sum, account ownership, safe integer posting values, and allowed negative balances. Under stable account locks, reject postings when the prospective balance of any affected asset account would leave the JavaScript safe-integer range. Archived asset accounts are closed to new postings; reversal involving one returns `409 Conflict`. Insert the transaction and all postings in the same DB transaction.
 
 - [ ] **Step 4: Implement account locks for constrained transfers**
 
@@ -473,6 +473,8 @@ expect(calculateBudgetOccurrences(
 Add a mid-period plan test that includes only not-yet-started intervals and a quarterly plan spanning an annual period.
 
 Add lifecycle tests: archiving a plan with a positive reserve posts `BUDGET_RESERVE → FREE` as `BUDGET_RELEASE` before archiving it; archiving a category releases and archives every active plan in that category in one transaction. Historical allocations and expense metadata retain the original category ID.
+
+Add closed-account tests: direct posting to an archived reserve is rejected; sequential reversal of its `BUDGET_RELEASE` returns `409` without changing balances; in a reversal/archive race either reversal completes before archival and the final reserve is fully released, or archival wins and reversal returns `409`. Add near-safe-limit tests proving prospective `FREE` and reserve balances cannot overflow. Ensure concurrency-test database hooks are removed in `finally` blocks.
 
 - [ ] **Step 2: Run and verify RED**
 
