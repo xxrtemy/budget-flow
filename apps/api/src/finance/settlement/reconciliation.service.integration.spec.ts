@@ -127,20 +127,35 @@ describe('ReconciliationService', () => {
     const reconciliation = new ReconciliationService(
       database(), noOpBudgets, noOpObligations, noOpIncomes, closer,
     ).reconcileUser(userId, RECONCILE_AT);
-    await enteredCloser.promise;
+    let creation: Promise<unknown> | undefined;
+    try {
+      await Promise.race([
+        enteredCloser.promise,
+        reconciliation.then(
+          () => Promise.reject(new Error('Reconciliation finished before the closer barrier')),
+          (error: unknown) => Promise.reject(error),
+        ),
+      ]);
+      creation = new CategoryService(database()).create(userId, 'Late category')
+        .then((category) => new BudgetService(database()).create({
+          userId,
+          categoryId: category.id,
+          amountMinor: 1_000,
+          startsOn: '2026-01-20',
+          cadence: 'MONTHLY',
+        }));
+      await waitForBlockedProfileLock();
+      expect(await categoryCount(userId)).toBe(0);
+    } finally {
+      releaseCloser.resolve();
+      await Promise.allSettled([
+        reconciliation,
+        ...(creation ? [creation] : []),
+      ]);
+    }
 
-    const creation = new CategoryService(database()).create(userId, 'Late category')
-      .then((category) => new BudgetService(database()).create({
-        userId,
-        categoryId: category.id,
-        amountMinor: 1_000,
-        startsOn: '2026-01-20',
-        cadence: 'MONTHLY',
-      }));
-    const state = await settlementState(creation);
-    releaseCloser.resolve();
+    expect(creation).toBeDefined();
     await expect(Promise.all([reconciliation, creation])).resolves.toHaveLength(2);
-    expect(state).toBe('blocked');
     expect(await countFinancialAccounts(userId, 'BUDGET_RESERVE')).toBe(1);
   });
 
@@ -296,11 +311,23 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-async function settlementState(promise: Promise<unknown>): Promise<'blocked' | 'settled'> {
-  return Promise.race([
-    promise.then(() => 'settled' as const, () => 'settled' as const),
-    new Promise<'blocked'>((resolve) => setTimeout(() => resolve('blocked'), 100)),
-  ]);
+async function waitForBlockedProfileLock(): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const result = await sql<{ pid: number }>`
+      select pid
+      from pg_stat_activity
+      where datname = current_database()
+        and pid <> pg_backend_pid()
+        and state = 'active'
+        and wait_event_type = 'Lock'
+        and query ilike '%from "financial_profiles"%'
+        and query ilike '%for update%'
+    `.execute(database());
+    if (result.rows.length > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error('Timed out waiting for category creation to block on the profile row');
 }
 
 function database(): Kysely<Database> {
