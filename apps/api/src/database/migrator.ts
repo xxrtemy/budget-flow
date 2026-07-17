@@ -1,3 +1,5 @@
+import '../config/load-environment';
+
 import type { Kysely } from 'kysely';
 import { Migrator, type Migration, type MigrationProvider } from 'kysely/migration';
 
