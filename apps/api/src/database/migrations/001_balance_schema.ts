@@ -2,10 +2,18 @@ import { sql, type Kysely } from 'kysely';
 
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`
+    create function is_valid_iana_timezone(timezone_name text) returns boolean as $$
+      select exists (
+        select 1
+        from pg_timezone_names
+        where name = timezone_name
+      );
+    $$ language sql stable;
+
     create table financial_profiles (
       user_id uuid primary key,
-      currency text not null,
-      timezone text not null,
+      currency text not null check (currency = 'RUB'),
+      timezone text not null default 'Europe/Moscow' check (is_valid_iana_timezone(timezone)),
       cadence text not null check (cadence in ('WEEKLY', 'MONTHLY', 'QUARTERLY', 'SEMIANNUAL', 'ANNUAL')),
       next_period_ends_on date not null,
       cycle_anchor_day smallint not null check (cycle_anchor_day between 1 and 31),
@@ -39,7 +47,8 @@ export async function up(db: Kysely<unknown>): Promise<void> {
       reversal_of uuid null references ledger_transactions(id),
       source_occurrence_id uuid null,
       metadata jsonb not null default '{}'::jsonb,
-      created_at timestamptz not null default now()
+      created_at timestamptz not null default now(),
+      check ((type = 'REVERSAL') = (reversal_of is not null))
     );
 
     create table ledger_postings (
@@ -175,7 +184,6 @@ export async function up(db: Kysely<unknown>): Promise<void> {
       )
     );
 
-    create index financial_profiles_user_id_idx on financial_profiles(user_id);
     create index financial_accounts_user_id_idx on financial_accounts(user_id);
     create index ledger_transactions_user_id_idx on ledger_transactions(user_id);
     create index ledger_postings_user_id_idx on ledger_postings(user_id);
@@ -201,6 +209,40 @@ export async function up(db: Kysely<unknown>): Promise<void> {
       on settlement_offers(user_id, period_id);
     create unique index idempotency_records_user_key
       on idempotency_records(user_id, idempotency_key);
+
+    create function enforce_reversal_owner() returns trigger as $$
+    begin
+      if new.reversal_of is not null and not exists (
+        select 1
+        from ledger_transactions target
+        where target.id = new.reversal_of and target.user_id = new.user_id
+      ) then
+        raise exception 'reversal target must belong to the same user'
+          using errcode = '23503';
+      end if;
+
+      return new;
+    end;
+    $$ language plpgsql;
+
+    create trigger ledger_transactions_reversal_owner
+      before insert on ledger_transactions
+      for each row execute function enforce_reversal_owner();
+
+    create function reject_ledger_mutation() returns trigger as $$
+    begin
+      raise exception 'ledger history is immutable'
+        using errcode = '55000';
+    end;
+    $$ language plpgsql;
+
+    create trigger ledger_transactions_immutable
+      before update or delete on ledger_transactions
+      for each row execute function reject_ledger_mutation();
+
+    create trigger ledger_postings_immutable
+      before update or delete on ledger_postings
+      for each row execute function reject_ledger_mutation();
 
     create function enforce_balanced_ledger_transaction() returns trigger as $$
     declare
@@ -249,6 +291,11 @@ export async function up(db: Kysely<unknown>): Promise<void> {
 
 export async function down(db: Kysely<unknown>): Promise<void> {
   await sql`
+    drop trigger if exists ledger_postings_immutable on ledger_postings;
+    drop trigger if exists ledger_transactions_immutable on ledger_transactions;
+    drop function if exists reject_ledger_mutation();
+    drop trigger if exists ledger_transactions_reversal_owner on ledger_transactions;
+    drop function if exists enforce_reversal_owner();
     drop trigger if exists ledger_postings_previous_transaction_balanced on ledger_postings;
     drop trigger if exists ledger_postings_balanced on ledger_postings;
     drop trigger if exists ledger_transactions_balanced on ledger_transactions;
@@ -267,5 +314,6 @@ export async function down(db: Kysely<unknown>): Promise<void> {
     drop table if exists ledger_transactions;
     drop table if exists financial_accounts;
     drop table if exists financial_profiles;
+    drop function if exists is_valid_iana_timezone(text);
   `.execute(db);
 }

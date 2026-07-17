@@ -15,17 +15,21 @@ export type AccountKind =
   | 'INCOME_SOURCE'
   | 'EXPENSE_SINK';
 
-type Timestamp = ColumnType<Date, Date | string, Date | string>;
-type CreatedAt = Generated<ColumnType<Date, Date | string | undefined, never>>;
-type UpdatedAt = Generated<ColumnType<Date, Date | string | undefined, Date | string>>;
+type Timestamp = ColumnType<Date, Date | string, Date>;
+type CreatedAt = Generated<Date>;
+type UpdatedAt = ColumnType<Date, Date | string | undefined, Date>;
 type DateOnly = ColumnType<string, string, string>;
 type Money = ColumnType<string, bigint | number | string, never>;
-type NullableMoney = ColumnType<string | null, bigint | number | string | null, never>;
+type NullableMoney = ColumnType<
+  string | null,
+  bigint | number | string | null,
+  bigint | number | string | null
+>;
 
 export interface FinancialProfilesTable {
   user_id: string;
-  currency: string;
-  timezone: string;
+  currency: 'RUB';
+  timezone: Generated<string>;
   cadence: CycleCadence;
   next_period_ends_on: DateOnly;
   cycle_anchor_day: number;
