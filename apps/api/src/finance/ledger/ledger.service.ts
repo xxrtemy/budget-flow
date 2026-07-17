@@ -30,7 +30,15 @@ const PAGE_SIZE = 50;
 const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
 const CURSOR_MICROS_PATTERN = /^[1-9][0-9]{0,15}$/;
 const MAX_CURSOR_MICROS = BigInt(Number.MAX_SAFE_INTEGER);
+const MAX_SAFE_MONEY = BigInt(Number.MAX_SAFE_INTEGER);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const ASSET_ACCOUNT_KINDS = new Set([
+  'FREE',
+  'OBLIGATION_RESERVE',
+  'BUDGET_RESERVE',
+  'SAVINGS_GENERAL',
+  'SAVINGS_GOAL',
+]);
 
 type TransactionRow = Selectable<LedgerTransactionsTable>;
 type PostingRow = Selectable<LedgerPostingsTable>;
@@ -215,10 +223,12 @@ export class LedgerService {
     }
 
     const accountIds = input.postings.map(({ accountId }) => accountId);
-    const ownedAccounts = await this.accounts.findByIds(input.userId, accountIds, trx);
-    if (ownedAccounts.length !== new Set(accountIds).size) {
-      throw new NotFoundException('Financial account not found');
-    }
+    const ownedAccounts = await this.accounts.lockPostingAccounts(
+      input.userId,
+      accountIds,
+      trx,
+    );
+    assertAccountsAcceptPostings(input, ownedAccounts);
     if (input.type === 'OPENING_BALANCE') {
       validateOpeningBalanceShape(input, ownedAccounts);
     }
@@ -324,6 +334,37 @@ export class LedgerService {
       createdAt: transactionRow.created_at,
       postings: postingsByTransaction.get(transactionRow.id) ?? [],
     }));
+  }
+}
+
+function assertAccountsAcceptPostings(
+  input: InternalPostLedgerInput,
+  accounts: ReadonlyArray<{
+    id: string;
+    kind: string;
+    archivedAt: Date | null;
+    balanceMinor: bigint;
+  }>,
+): void {
+  const deltaByAccount = new Map<string, bigint>();
+  for (const { accountId, amountMinor } of input.postings) {
+    deltaByAccount.set(
+      accountId,
+      (deltaByAccount.get(accountId) ?? 0n) + BigInt(amountMinor),
+    );
+  }
+
+  for (const account of accounts) {
+    if (!ASSET_ACCOUNT_KINDS.has(account.kind)) {
+      continue;
+    }
+    if (account.archivedAt) {
+      throw new ConflictException('Financial account is archived');
+    }
+    const prospectiveBalance = account.balanceMinor + (deltaByAccount.get(account.id) ?? 0n);
+    if (prospectiveBalance < -MAX_SAFE_MONEY || prospectiveBalance > MAX_SAFE_MONEY) {
+      throw new ConflictException('Financial account balance exceeds the safe integer range');
+    }
   }
 }
 

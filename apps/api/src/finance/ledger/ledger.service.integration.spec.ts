@@ -234,6 +234,28 @@ describe('LedgerService', () => {
     await expect(ledger.getAccountBalance(userId, freeId)).resolves.toBe(-5_000);
   });
 
+  test('rejects a posting whose prospective FREE balance exceeds the safe integer range', async () => {
+    const userId = await createUser();
+    const freeId = await accountId(userId, 'FREE');
+    const incomeId = await accountId(userId, 'INCOME_SOURCE');
+    const ledger = ledgerService();
+    await ledger.createOpeningBalance(userId, Number.MAX_SAFE_INTEGER, NOW);
+
+    await expect(ledger.post({
+      userId,
+      type: 'INCOME',
+      effectiveAt: NOW,
+      postings: [
+        { accountId: incomeId, amountMinor: -1 },
+        { accountId: freeId, amountMinor: 1 },
+      ],
+    })).rejects.toMatchObject({ status: HttpStatus.CONFLICT });
+
+    await expect(ledger.getAccountBalance(userId, freeId))
+      .resolves.toBe(Number.MAX_SAFE_INTEGER);
+    await expect(transactionCount(userId)).resolves.toBe(1);
+  });
+
   test('locks scoped accounts in stable UUID order and reads balances in the transaction', async () => {
     const userId = await createUser();
     const freeId = await accountId(userId, 'FREE');

@@ -12,6 +12,12 @@ export interface AccountIdentity {
   kind: AccountKind;
 }
 
+export interface LockedPostingAccount extends AccountIdentity {
+  userId: string;
+  archivedAt: Date | null;
+  balanceMinor: bigint;
+}
+
 @Injectable()
 export class AccountRepository {
   constructor(@Inject(DATABASE) private readonly db: Kysely<Database>) {}
@@ -81,6 +87,19 @@ export class AccountRepository {
     accountIds: readonly string[],
     trx: Transaction<Database>,
   ): Promise<LockedAccount[]> {
+    const accounts = await this.lockPostingAccounts(userId, accountIds, trx);
+    return accounts.map((account) => ({
+      id: account.id,
+      userId: account.userId,
+      balanceMinor: parseDatabaseMoney(account.balanceMinor.toString()),
+    }));
+  }
+
+  async lockPostingAccounts(
+    userId: string,
+    accountIds: readonly string[],
+    trx: Transaction<Database>,
+  ): Promise<LockedPostingAccount[]> {
     const uniqueIds = uniqueSortedIds(accountIds);
     if (uniqueIds.length === 0) {
       return [];
@@ -88,7 +107,7 @@ export class AccountRepository {
 
     const accounts = await trx
       .selectFrom('financial_accounts')
-      .select(['id', 'user_id'])
+      .select(['id', 'user_id', 'kind', 'archived_at'])
       .where('user_id', '=', userId)
       .where('id', 'in', uniqueIds)
       .orderBy('id')
@@ -111,14 +130,16 @@ export class AccountRepository {
     const balanceByAccount = new Map(
       balances.map(({ account_id, balance_minor }) => [
         account_id,
-        parseDatabaseMoney(balance_minor),
+        BigInt(balance_minor),
       ]),
     );
 
     return accounts.map((account) => ({
       id: account.id,
       userId: account.user_id,
-      balanceMinor: balanceByAccount.get(account.id) ?? 0,
+      kind: account.kind,
+      archivedAt: account.archived_at,
+      balanceMinor: balanceByAccount.get(account.id) ?? 0n,
     }));
   }
 }

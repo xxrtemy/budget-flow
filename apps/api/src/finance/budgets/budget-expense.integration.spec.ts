@@ -18,6 +18,7 @@ import { BudgetService } from './budget.service';
 const NOW = new Date('2026-07-17T08:00:00.000Z');
 const BUDGET_UPDATE_LOCK_KEY = 41_004;
 const CATEGORY_ARCHIVE_LOCK_KEY = 41_005;
+const REVERSAL_INSERT_LOCK_KEY = 41_006;
 
 let context: DatabaseTestContext | undefined;
 
@@ -248,6 +249,142 @@ describe('category budget expenses', () => {
       .executeTakeFirstOrThrow()).resolves.toEqual(allocationBefore);
   });
 
+  test('rejects direct postings to an archived budget reserve', async () => {
+    const userId = await createUserWithOpeningBalance(20_000);
+    const category = await new CategoryService(database()).create(userId, 'Food');
+    const budget = budgetService();
+    const plan = await budget.create({
+      userId,
+      categoryId: category.id,
+      amountMinor: 5_000,
+      startsOn: '2026-07-17',
+      cadence: 'ANNUAL',
+    });
+    await budget.reconcilePeriod(userId, await currentPeriodId(userId), NOW);
+    await budget.archive(userId, plan.id);
+    const transactionCountBefore = await transactionCount(userId, 'BUDGET_RESERVATION');
+
+    await expect(new LedgerService(database()).post({
+      userId,
+      type: 'BUDGET_RESERVATION',
+      effectiveAt: NOW,
+      postings: [
+        { accountId: await expenseSinkAccountId(userId), amountMinor: -100 },
+        { accountId: plan.reserveAccountId, amountMinor: 100 },
+      ],
+    })).rejects.toMatchObject({ status: HttpStatus.CONFLICT });
+
+    await expect(accountBalance(userId, plan.reserveAccountId)).resolves.toBe(0);
+    await expect(transactionCount(userId, 'BUDGET_RESERVATION'))
+      .resolves.toBe(transactionCountBefore);
+  });
+
+  test('rejects reversal of a budget release after its reserve was archived', async () => {
+    const userId = await createUserWithOpeningBalance(20_000);
+    const category = await new CategoryService(database()).create(userId, 'Food');
+    const budget = budgetService();
+    const plan = await budget.create({
+      userId,
+      categoryId: category.id,
+      amountMinor: 5_000,
+      startsOn: '2026-07-17',
+      cadence: 'ANNUAL',
+    });
+    await budget.reconcilePeriod(userId, await currentPeriodId(userId), NOW);
+    await budget.archive(userId, plan.id);
+    const release = await ledgerTransaction(userId, 'BUDGET_RELEASE', plan.id);
+    const freeId = await systemAccountId(userId, 'FREE');
+    const transactionCountBefore = await allTransactionCount(userId);
+
+    await expect(new LedgerService(database()).reverse(userId, release.id, NOW))
+      .rejects.toMatchObject({ status: HttpStatus.CONFLICT });
+
+    await expect(accountBalance(userId, freeId)).resolves.toBe(20_000);
+    await expect(accountBalance(userId, plan.reserveAccountId)).resolves.toBe(0);
+    await expect(allTransactionCount(userId)).resolves.toBe(transactionCountBefore);
+  });
+
+  test('serializes reversal before archive and releases the restored reserve without stranding value', async () => {
+    const userId = await createUserWithOpeningBalance(20_000);
+    const category = await new CategoryService(database()).create(userId, 'Food');
+    const budget = budgetService();
+    const plan = await budget.create({
+      userId,
+      categoryId: category.id,
+      amountMinor: 5_000,
+      startsOn: '2026-07-17',
+      cadence: 'ANNUAL',
+    });
+    await budget.reconcilePeriod(userId, await currentPeriodId(userId), NOW);
+    const expense = await new ExpenseService(database()).create({
+      userId,
+      categoryId: category.id,
+      amountMinor: 2_000,
+      occurredAt: NOW,
+    });
+    const blocker = await holdAdvisoryLock(REVERSAL_INSERT_LOCK_KEY);
+
+    try {
+      await installReversalInsertWaitTrigger();
+      const reversal = new LedgerService(database()).reverse(userId, expense.id, NOW);
+      await waitForBlockedQuery('insert into "ledger_transactions"');
+      const archive = budget.archive(userId, plan.id);
+      await expect(settlementState(archive)).resolves.toBe('blocked');
+      blocker.release();
+      await blocker.done;
+      await Promise.all([reversal, archive]);
+    } finally {
+      blocker.release();
+      await blocker.done;
+      await removeReversalInsertWaitTrigger();
+    }
+
+    await expect(accountBalance(userId, await systemAccountId(userId, 'FREE')))
+      .resolves.toBe(20_000);
+    await expect(accountBalance(userId, plan.reserveAccountId)).resolves.toBe(0);
+    await expect(database().selectFrom('financial_accounts')
+      .select('archived_at')
+      .where('user_id', '=', userId)
+      .where('id', '=', plan.reserveAccountId)
+      .executeTakeFirstOrThrow()).resolves.toMatchObject({ archived_at: expect.any(Date) });
+  });
+
+  test('rejects a posting whose prospective budget reserve balance exceeds the safe range', async () => {
+    const userId = await createUserWithOpeningBalance(1_000);
+    const category = await new CategoryService(database()).create(userId, 'Food');
+    const plan = await budgetService().create({
+      userId,
+      categoryId: category.id,
+      amountMinor: 1,
+      startsOn: '2026-07-17',
+      cadence: 'ANNUAL',
+    });
+    const sinkId = await expenseSinkAccountId(userId);
+    const ledger = new LedgerService(database());
+    await ledger.post({
+      userId,
+      type: 'BUDGET_RESERVATION',
+      effectiveAt: NOW,
+      postings: [
+        { accountId: sinkId, amountMinor: -Number.MAX_SAFE_INTEGER },
+        { accountId: plan.reserveAccountId, amountMinor: Number.MAX_SAFE_INTEGER },
+      ],
+    });
+
+    await expect(ledger.post({
+      userId,
+      type: 'BUDGET_RESERVATION',
+      effectiveAt: NOW,
+      postings: [
+        { accountId: sinkId, amountMinor: -1 },
+        { accountId: plan.reserveAccountId, amountMinor: 1 },
+      ],
+    })).rejects.toMatchObject({ status: HttpStatus.CONFLICT });
+
+    await expect(accountBalance(userId, plan.reserveAccountId))
+      .resolves.toBe(Number.MAX_SAFE_INTEGER);
+  });
+
   test('archives a category by releasing and archiving every active plan atomically', async () => {
     const userId = await createUserWithOpeningBalance(30_000);
     const categories = new CategoryService(database());
@@ -310,9 +447,9 @@ describe('category budget expenses', () => {
       cadence: 'ANNUAL',
     });
     await budget.reconcilePeriod(userId, await currentPeriodId(userId), NOW);
-    await installArchiveFailureTrigger();
 
     try {
+      await installArchiveFailureTrigger();
       await expect(categories.archive(userId, category.id)).rejects.toThrow('induced archive failure');
     } finally {
       await removeArchiveFailureTrigger();
@@ -344,9 +481,9 @@ describe('category budget expenses', () => {
       cadence: 'ANNUAL',
     });
     const blocker = await holdAdvisoryLock(BUDGET_UPDATE_LOCK_KEY);
-    await installBudgetUpdateWaitTrigger();
 
     try {
+      await installBudgetUpdateWaitTrigger();
       const update = budget.update(userId, plan.id, { amountMinor: 8_000 }, NOW);
       await waitForBlockedQuery('update "budget_plans"');
       const reconcile = budget.reconcilePeriod(userId, await currentPeriodId(userId), NOW);
@@ -376,9 +513,9 @@ describe('category budget expenses', () => {
       cadence: 'ANNUAL',
     });
     const blocker = await holdAdvisoryLock(CATEGORY_ARCHIVE_LOCK_KEY);
-    await installCategoryArchiveWaitTrigger();
 
     try {
+      await installCategoryArchiveWaitTrigger();
       const archive = categories.archive(userId, category.id);
       await waitForBlockedQuery('update "categories"');
       const reconcile = budget.reconcilePeriod(userId, await currentPeriodId(userId), NOW);
@@ -553,6 +690,14 @@ async function transactionCount(userId: string, type: string): Promise<number> {
   return Number(result.count);
 }
 
+async function allTransactionCount(userId: string): Promise<number> {
+  const result = await database().selectFrom('ledger_transactions')
+    .select((expression) => expression.fn.countAll<string>().as('count'))
+    .where('user_id', '=', userId)
+    .executeTakeFirstOrThrow();
+  return Number(result.count);
+}
+
 async function ledgerTransaction(
   userId: string,
   type: string,
@@ -667,6 +812,29 @@ async function removeCategoryArchiveWaitTrigger(): Promise<void> {
   await sql`
     drop trigger if exists task4_wait_for_category_archive on categories;
     drop function if exists task4_wait_for_category_archive()
+  `.execute(database());
+}
+
+async function installReversalInsertWaitTrigger(): Promise<void> {
+  await sql`
+    create function task4_wait_for_reversal_insert() returns trigger as $$
+    begin
+      if new.type = 'REVERSAL' then
+        perform pg_advisory_xact_lock(41006);
+      end if;
+      return new;
+    end;
+    $$ language plpgsql;
+    create trigger task4_wait_for_reversal_insert
+      before insert on ledger_transactions
+      for each row execute function task4_wait_for_reversal_insert()
+  `.execute(database());
+}
+
+async function removeReversalInsertWaitTrigger(): Promise<void> {
+  await sql`
+    drop trigger if exists task4_wait_for_reversal_insert on ledger_transactions;
+    drop function if exists task4_wait_for_reversal_insert()
   `.execute(database());
 }
 
