@@ -19,6 +19,7 @@ import {
   type PeriodCloser,
   ReconciliationService,
 } from './reconciliation.service';
+import { SettlementService } from './settlement.service';
 
 const PROFILE_NOW = new Date('2026-01-01T09:00:00.000Z');
 const RECONCILE_AT = new Date('2026-01-15T12:00:00.000Z');
@@ -67,6 +68,55 @@ describe('ReconciliationService', () => {
     expect(calls).toEqual([
       'budgets', 'obligation-reserve', 'income', 'obligation-apply', 'closer',
     ]);
+  });
+
+  test('stops after one effect pass when a no-op closer leaves the same due period', async () => {
+    const userId = await createWeeklyProfile();
+    const calls: string[] = [];
+    const budgets = { async reconcileOpenPeriods() { calls.push('budget'); } } as unknown as BudgetService;
+    const obligations = {
+      async reserveOpenPeriods() { calls.push('reserve'); },
+      async applyDue() { calls.push('obligation'); },
+    } as unknown as ObligationService;
+    const incomes = { async materializeAndApplyDue() { calls.push('income'); } } as unknown as IncomeService;
+    const closer = { async closeDuePeriods() { calls.push('close'); } };
+
+    await new ReconciliationService(database(), budgets, obligations, incomes, closer)
+      .reconcileUser(userId, new Date('2026-01-25T12:00:00Z'));
+
+    expect(calls).toEqual(['budget', 'reserve', 'income', 'obligation', 'close']);
+  });
+
+  test('catches up every overdue period through the full effect order before stopping on current', async () => {
+    const userId = await createWeeklyProfile();
+    const category = await new CategoryService(database()).create(userId, 'Weekly food');
+    const budget = await new BudgetService(database()).create({
+      userId, categoryId: category.id, amountMinor: 1_000,
+      startsOn: '2026-01-01', cadence: 'WEEKLY',
+    });
+    await database().updateTable('budget_plans').set({
+      created_at: PROFILE_NOW, updated_at: PROFILE_NOW,
+    }).where('user_id', '=', userId).where('id', '=', budget.id).execute();
+    await new IncomeService(database()).createSchedule({
+      userId, amountMinor: 10_000, startsOn: '2026-01-03',
+      cadence: 'WEEKLY', name: 'Weekly income',
+    });
+
+    const budgets = new BudgetService(database());
+    const service = new ReconciliationService(
+      database(), budgets, new ObligationService(database()), new IncomeService(database()),
+      new SettlementService(database(), budgets),
+    );
+    await service.reconcileUser(userId, new Date('2026-01-25T12:00:00Z'));
+
+    expect(await count('calculation_periods', userId, (query) => query.where('status', '=', 'CLOSED')))
+      .toBe(4);
+    expect(await openPeriodCount(userId)).toBe(1);
+    expect(await occurrenceCount(userId, 'INCOME')).toBe(4);
+    expect(await transactionCount(userId, 'INCOME')).toBe(4);
+    const allocationPeriods = await database().selectFrom('budget_allocations')
+      .select('period_id').distinct().where('user_id', '=', userId).execute();
+    expect(allocationPeriods).toHaveLength(5);
   });
 
   test('rolls back all domain effects when the period closer fails', async () => {
@@ -231,6 +281,17 @@ async function createProfile(): Promise<string> {
     timezone: 'Europe/Moscow',
     cadence: 'MONTHLY',
     firstPeriodEndsOn: '2026-01-31',
+  });
+  return userId;
+}
+
+async function createWeeklyProfile(): Promise<string> {
+  const userId = randomUUID();
+  await new ProfileService(new ProfileRepository(database()), () => PROFILE_NOW).upsert({
+    userId,
+    timezone: 'Europe/Moscow',
+    cadence: 'WEEKLY',
+    firstPeriodEndsOn: '2026-01-02',
   });
   return userId;
 }

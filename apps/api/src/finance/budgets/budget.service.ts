@@ -255,6 +255,77 @@ export class BudgetService {
     await this.db.transaction().execute(work);
   }
 
+  async releasePeriodRemainders(
+    userId: string,
+    periodId: string,
+    releasedAt: Date,
+    trx: Transaction<Database>,
+  ): Promise<void> {
+    validateDate(releasedAt, 'releasedAt');
+    const plans = await lockAllActiveBudgetPlans(userId, trx);
+    if (plans.length === 0) return;
+
+    const allocations = await trx.selectFrom('budget_allocations')
+      .select(['id', 'budget_plan_id'])
+      .where('user_id', '=', userId)
+      .where('period_id', '=', periodId)
+      .where('released_transaction_id', 'is', null)
+      .where('budget_plan_id', 'in', plans.map(({ id }) => id))
+      .orderBy('id')
+      .forUpdate()
+      .execute();
+    const periodPlanIds = [...new Set(allocations.map(({ budget_plan_id }) => budget_plan_id))]
+      .sort();
+    if (periodPlanIds.length === 0) return;
+
+    const reserveAccounts = await trx.selectFrom('financial_accounts')
+      .select(['id', 'reference_id'])
+      .where('user_id', '=', userId)
+      .where('kind', '=', 'BUDGET_RESERVE')
+      .where('reference_id', 'in', periodPlanIds)
+      .where('archived_at', 'is', null)
+      .orderBy('id')
+      .execute();
+    if (reserveAccounts.length !== periodPlanIds.length) {
+      throw new NotFoundException('Budget reserve account not found');
+    }
+    const freeAccount = await trx.selectFrom('financial_accounts').select('id')
+      .where('user_id', '=', userId).where('kind', '=', 'FREE')
+      .where('archived_at', 'is', null).executeTakeFirst();
+    if (!freeAccount) throw new NotFoundException('Financial profile not found');
+
+    const locked = await this.accounts.lockPostingAccounts(
+      userId,
+      [freeAccount.id, ...reserveAccounts.map(({ id }) => id)],
+      trx,
+    );
+    const balanceById = new Map(locked.map(({ id, balanceMinor }) => [id, balanceMinor]));
+    const reserveByPlan = new Map(reserveAccounts.map(({ id, reference_id }) => [reference_id!, id]));
+    for (const planId of periodPlanIds) {
+      const reserveId = reserveByPlan.get(planId)!;
+      const remainder = balanceById.get(reserveId) ?? 0n;
+      if (remainder <= 0n) continue;
+      const amountMinor = parseSafeBigInt(remainder, 'budget remainder');
+      const release = await this.ledger.post({
+        userId,
+        type: 'BUDGET_RELEASE',
+        effectiveAt: releasedAt,
+        metadata: { budgetPlanId: planId, periodId },
+        postings: [
+          { accountId: reserveId, amountMinor: -amountMinor },
+          { accountId: freeAccount.id, amountMinor },
+        ],
+      }, trx);
+      await trx.updateTable('budget_allocations')
+        .set({ released_transaction_id: release.id })
+        .where('user_id', '=', userId)
+        .where('period_id', '=', periodId)
+        .where('budget_plan_id', '=', planId)
+        .where('released_transaction_id', 'is', null)
+        .execute();
+    }
+  }
+
   private async reconcileInTransaction(
     userId: string,
     periodId: string,
@@ -452,6 +523,14 @@ function parseMoney(value: string): number {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed)) {
     throw new Error('Stored budget amount exceeds the safe integer range');
+  }
+  return parsed;
+}
+
+function parseSafeBigInt(value: bigint, label: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`Stored ${label} exceeds the safe integer range`);
   }
   return parsed;
 }

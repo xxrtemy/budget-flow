@@ -1,6 +1,5 @@
 import {
   BadRequestException,
-  ConflictException,
   Inject,
   Injectable,
   NotFoundException,
@@ -36,12 +35,27 @@ export class ReconciliationService {
     await this.db.transaction().execute(async (trx) => {
       await sql`select pg_advisory_xact_lock(hashtextextended(${userId}::text, 0))`.execute(trx);
       await this.ensureOpenPeriodsAndLockUserState(userId, trx);
-      await this.budgets.reconcileOpenPeriods(userId, now, trx);
-      await this.obligations.reserveOpenPeriods(userId, now, trx);
-      await this.incomes.materializeAndApplyDue(userId, now, trx);
-      await this.obligations.applyDue(userId, now, trx);
-      await this.periodCloser.closeDuePeriods(userId, now, trx);
+      for (;;) {
+        const beforePeriodId = await this.openPeriodId(userId, trx);
+        await this.budgets.reconcileOpenPeriods(userId, now, trx);
+        await this.obligations.reserveOpenPeriods(userId, now, trx);
+        await this.incomes.materializeAndApplyDue(userId, now, trx);
+        await this.obligations.applyDue(userId, now, trx);
+        await this.periodCloser.closeDuePeriods(userId, now, trx);
+        const afterPeriodId = await this.openPeriodId(userId, trx);
+        if (beforePeriodId === afterPeriodId) break;
+      }
     });
+  }
+
+  private async openPeriodId(userId: string, trx: Transaction<Database>): Promise<string> {
+    const period = await trx.selectFrom('calculation_periods').select('id')
+      .where('user_id', '=', userId).where('status', '=', 'OPEN')
+      .orderBy('starts_at').orderBy('id').executeTakeFirst();
+    if (!period) {
+      throw new NotFoundException('Current calculation period not found');
+    }
+    return period.id;
   }
 
   private async ensureOpenPeriodsAndLockUserState(
@@ -56,7 +70,7 @@ export class ReconciliationService {
       .where('user_id', '=', userId).where('status', '=', 'OPEN')
       .orderBy('id').forUpdate().execute();
     if (periods.length === 0) {
-      throw new ConflictException('Financial profile has no open calculation period');
+      throw new NotFoundException('Current calculation period not found');
     }
 
     // Reconciliation keeps this complete, deterministic lock prefix for the
