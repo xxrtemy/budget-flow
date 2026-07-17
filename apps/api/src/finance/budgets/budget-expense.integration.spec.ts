@@ -16,6 +16,8 @@ import { ProfileService } from '../profile/profile.service';
 import { BudgetService } from './budget.service';
 
 const NOW = new Date('2026-07-17T08:00:00.000Z');
+const BUDGET_UPDATE_LOCK_KEY = 41_004;
+const CATEGORY_ARCHIVE_LOCK_KEY = 41_005;
 
 let context: DatabaseTestContext | undefined;
 
@@ -203,17 +205,290 @@ describe('category budget expenses', () => {
       .rejects.toMatchObject({ status: HttpStatus.NOT_FOUND });
   });
 
-  test('rejects malformed scoped cursors as domain 400 errors', async () => {
+  test('archives a plan by releasing its positive reserve to FREE and preserving allocation history', async () => {
+    const userId = await createUserWithOpeningBalance(20_000);
+    const category = await new CategoryService(database()).create(userId, 'Food');
+    const budget = budgetService();
+    const plan = await budget.create({
+      userId,
+      categoryId: category.id,
+      amountMinor: 7_000,
+      startsOn: '2026-07-17',
+      cadence: 'ANNUAL',
+    });
+    await budget.reconcilePeriod(userId, await currentPeriodId(userId), NOW);
+    const allocationBefore = await database().selectFrom('budget_allocations')
+      .selectAll()
+      .where('user_id', '=', userId)
+      .where('budget_plan_id', '=', plan.id)
+      .executeTakeFirstOrThrow();
+
+    await budget.archive(userId, plan.id);
+
+    await expect(accountBalance(userId, await systemAccountId(userId, 'FREE')))
+      .resolves.toBe(20_000);
+    await expect(accountBalance(userId, plan.reserveAccountId)).resolves.toBe(0);
+    const release = await ledgerTransaction(userId, 'BUDGET_RELEASE', plan.id);
+    expect(release.postings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ accountId: plan.reserveAccountId, amountMinor: -7_000 }),
+      expect.objectContaining({
+        accountId: await systemAccountId(userId, 'FREE'),
+        amountMinor: 7_000,
+      }),
+    ]));
+    await expect(database().selectFrom('financial_accounts')
+      .select('archived_at')
+      .where('user_id', '=', userId)
+      .where('id', '=', plan.reserveAccountId)
+      .executeTakeFirstOrThrow()).resolves.toMatchObject({ archived_at: expect.any(Date) });
+    await expect(database().selectFrom('budget_allocations')
+      .selectAll()
+      .where('user_id', '=', userId)
+      .where('id', '=', allocationBefore.id)
+      .executeTakeFirstOrThrow()).resolves.toEqual(allocationBefore);
+  });
+
+  test('archives a category by releasing and archiving every active plan atomically', async () => {
+    const userId = await createUserWithOpeningBalance(30_000);
+    const categories = new CategoryService(database());
+    const category = await categories.create(userId, 'Food');
+    const budget = budgetService();
+    const plans = await Promise.all([4_000, 6_000].map((amountMinor) => budget.create({
+      userId,
+      categoryId: category.id,
+      amountMinor,
+      startsOn: '2026-07-17',
+      cadence: 'ANNUAL',
+    })));
+    await budget.reconcilePeriod(userId, await currentPeriodId(userId), NOW);
+    const expense = await new ExpenseService(database()).create({
+      userId,
+      categoryId: category.id,
+      amountMinor: 1_000,
+      occurredAt: NOW,
+      description: 'Historical category expense',
+    });
+
+    await categories.archive(userId, category.id);
+
+    await expect(accountBalance(userId, await systemAccountId(userId, 'FREE')))
+      .resolves.toBe(29_000);
+    await expect(transactionCount(userId, 'BUDGET_RELEASE')).resolves.toBe(2);
+    const archivedPlans = await database().selectFrom('budget_plans')
+      .select(['id', 'archived_at'])
+      .where('user_id', '=', userId)
+      .where('category_id', '=', category.id)
+      .orderBy('id')
+      .execute();
+    expect(archivedPlans).toHaveLength(2);
+    expect(archivedPlans.every(({ archived_at }) => archived_at instanceof Date)).toBe(true);
+    const archivedAccounts = await database().selectFrom('financial_accounts')
+      .select(['id', 'archived_at'])
+      .where('user_id', '=', userId)
+      .where('id', 'in', plans.map(({ reserveAccountId }) => reserveAccountId))
+      .execute();
+    expect(archivedAccounts.every(({ archived_at }) => archived_at instanceof Date)).toBe(true);
+    await expect(new ExpenseService(database()).list(userId)).resolves.toMatchObject({
+      items: [{
+        id: expense.id,
+        categoryId: category.id,
+        description: 'Historical category expense',
+      }],
+    });
+  });
+
+  test('rolls back the release and all archives when category archival fails', async () => {
+    const userId = await createUserWithOpeningBalance(20_000);
+    const categories = new CategoryService(database());
+    const category = await categories.create(userId, 'Food');
+    const budget = budgetService();
+    const plan = await budget.create({
+      userId,
+      categoryId: category.id,
+      amountMinor: 5_000,
+      startsOn: '2026-07-17',
+      cadence: 'ANNUAL',
+    });
+    await budget.reconcilePeriod(userId, await currentPeriodId(userId), NOW);
+    await installArchiveFailureTrigger();
+
+    try {
+      await expect(categories.archive(userId, category.id)).rejects.toThrow('induced archive failure');
+    } finally {
+      await removeArchiveFailureTrigger();
+    }
+
+    await expect(transactionCount(userId, 'BUDGET_RELEASE')).resolves.toBe(0);
+    await expect(accountBalance(userId, plan.reserveAccountId)).resolves.toBe(5_000);
+    await expect(database().selectFrom('categories')
+      .select('archived_at')
+      .where('user_id', '=', userId)
+      .where('id', '=', category.id)
+      .executeTakeFirstOrThrow()).resolves.toEqual({ archived_at: null });
+    await expect(database().selectFrom('budget_plans')
+      .select('archived_at')
+      .where('user_id', '=', userId)
+      .where('id', '=', plan.id)
+      .executeTakeFirstOrThrow()).resolves.toEqual({ archived_at: null });
+  });
+
+  test('serializes a budget update before reconcile reads the plan rule', async () => {
+    const userId = await createUserWithOpeningBalance(20_000);
+    const category = await new CategoryService(database()).create(userId, 'Food');
+    const budget = budgetService();
+    const plan = await budget.create({
+      userId,
+      categoryId: category.id,
+      amountMinor: 3_000,
+      startsOn: '2026-07-17',
+      cadence: 'ANNUAL',
+    });
+    const blocker = await holdAdvisoryLock(BUDGET_UPDATE_LOCK_KEY);
+    await installBudgetUpdateWaitTrigger();
+
+    try {
+      const update = budget.update(userId, plan.id, { amountMinor: 8_000 }, NOW);
+      await waitForBlockedQuery('update "budget_plans"');
+      const reconcile = budget.reconcilePeriod(userId, await currentPeriodId(userId), NOW);
+      await expect(settlementState(reconcile)).resolves.toBe('blocked');
+      blocker.release();
+      await blocker.done;
+      await Promise.all([update, reconcile]);
+    } finally {
+      blocker.release();
+      await blocker.done;
+      await removeBudgetUpdateWaitTrigger();
+    }
+
+    await expect(accountBalance(userId, plan.reserveAccountId)).resolves.toBe(8_000);
+  });
+
+  test('serializes category archive before reconcile re-checks active category and plan state', async () => {
+    const userId = await createUserWithOpeningBalance(20_000);
+    const categories = new CategoryService(database());
+    const category = await categories.create(userId, 'Food');
+    const budget = budgetService();
+    await budget.create({
+      userId,
+      categoryId: category.id,
+      amountMinor: 5_000,
+      startsOn: '2026-07-17',
+      cadence: 'ANNUAL',
+    });
+    const blocker = await holdAdvisoryLock(CATEGORY_ARCHIVE_LOCK_KEY);
+    await installCategoryArchiveWaitTrigger();
+
+    try {
+      const archive = categories.archive(userId, category.id);
+      await waitForBlockedQuery('update "categories"');
+      const reconcile = budget.reconcilePeriod(userId, await currentPeriodId(userId), NOW);
+      await expect(settlementState(reconcile)).resolves.toBe('blocked');
+      blocker.release();
+      await blocker.done;
+      await Promise.all([archive, reconcile]);
+    } finally {
+      blocker.release();
+      await blocker.done;
+      await removeCategoryArchiveWaitTrigger();
+    }
+
+    await expect(allocationCount(userId)).resolves.toBe(0);
+    await expect(transactionCount(userId, 'BUDGET_RESERVATION')).resolves.toBe(0);
+  });
+
+  test('rejects an unsafe aggregate category reserve without writing expense metadata', async () => {
+    const userId = await createUserWithOpeningBalance(1_000);
+    const category = await new CategoryService(database()).create(userId, 'Food');
+    const budget = budgetService();
+    const plans = await Promise.all([1, 2].map(() => budget.create({
+      userId,
+      categoryId: category.id,
+      amountMinor: 1,
+      startsOn: '2026-07-17',
+      cadence: 'ANNUAL',
+    })));
+    const sinkId = await expenseSinkAccountId(userId);
+    for (const plan of plans) {
+      await new LedgerService(database()).post({
+        userId,
+        type: 'BUDGET_RESERVATION',
+        effectiveAt: NOW,
+        postings: [
+          { accountId: sinkId, amountMinor: -Number.MAX_SAFE_INTEGER },
+          { accountId: plan.reserveAccountId, amountMinor: Number.MAX_SAFE_INTEGER },
+        ],
+      });
+    }
+
+    await expect(new ExpenseService(database()).create({
+      userId,
+      categoryId: category.id,
+      amountMinor: 1,
+      occurredAt: NOW,
+    })).rejects.toMatchObject({ status: HttpStatus.CONFLICT });
+    await expect(transactionCount(userId, 'ORDINARY_EXPENSE')).resolves.toBe(0);
+  });
+
+  test('filters expense posting reads by user even for already-scoped transaction ids', async () => {
+    const userId = await createUserWithOpeningBalance(1_000);
+    const category = await new CategoryService(database()).create(userId, 'Food');
+    const expenseService = new ExpenseService(database());
+    const expense = await expenseService.create({
+      userId,
+      categoryId: category.id,
+      amountMinor: 100,
+      occurredAt: NOW,
+    });
+    const foreignUserId = randomUUID();
+    const sinkId = await expenseSinkAccountId(userId);
+    const freeId = await systemAccountId(userId, 'FREE');
+    await database().insertInto('ledger_postings').values([
+      {
+        id: randomUUID(),
+        transaction_id: expense.id,
+        user_id: foreignUserId,
+        account_id: sinkId,
+        amount_minor: 77,
+      },
+      {
+        id: randomUUID(),
+        transaction_id: expense.id,
+        user_id: foreignUserId,
+        account_id: freeId,
+        amount_minor: -77,
+      },
+    ]).execute();
+
+    const [listed] = (await expenseService.list(userId)).items;
+
+    expect(listed?.amountMinor).toBe(100);
+    expect(listed?.transaction.postings).toHaveLength(2);
+    expect(listed?.transaction.postings.every((posting) => posting.userId === userId)).toBe(true);
+    const ledgerExpense = (await new LedgerService(database()).list(userId)).items
+      .find(({ id }) => id === expense.id);
+    expect(ledgerExpense?.postings).toHaveLength(2);
+    expect(ledgerExpense?.postings.every((posting) => posting.userId === userId)).toBe(true);
+  });
+
+  test('rejects malformed category, budget and expense cursors with one domain error', async () => {
     const userId = await createUserWithOpeningBalance(1_000);
     const malformedCursor = Buffer.from(JSON.stringify({
       createdAtMicros: '1784275200000000',
       id: 'not-a-uuid',
     })).toString('base64url');
 
-    await expect(new CategoryService(database()).list(userId, malformedCursor))
-      .rejects.toMatchObject({ status: HttpStatus.BAD_REQUEST });
-    await expect(budgetService().list(userId, malformedCursor))
-      .rejects.toMatchObject({ status: HttpStatus.BAD_REQUEST });
+    const services = [
+      new CategoryService(database()),
+      budgetService(),
+      new ExpenseService(database()),
+    ];
+    for (const service of services) {
+      await expect(service.list(userId, malformedCursor))
+        .rejects.toMatchObject({
+          status: HttpStatus.BAD_REQUEST,
+          response: { message: 'Invalid cursor' },
+        });
+    }
   });
 });
 
@@ -276,6 +551,146 @@ async function transactionCount(userId: string, type: string): Promise<number> {
     .where('type', '=', type)
     .executeTakeFirstOrThrow();
   return Number(result.count);
+}
+
+async function ledgerTransaction(
+  userId: string,
+  type: string,
+  budgetPlanId: string,
+) {
+  const transactions = (await new LedgerService(database()).list(userId)).items;
+  const transaction = transactions.find((item) =>
+    item.type === type && item.metadata.budgetPlanId === budgetPlanId);
+  if (!transaction) {
+    throw new Error(`${type} ledger transaction not found`);
+  }
+  return transaction;
+}
+
+async function expenseSinkAccountId(userId: string): Promise<string> {
+  const account = await database().selectFrom('financial_accounts')
+    .select('id')
+    .where('user_id', '=', userId)
+    .where('kind', '=', 'EXPENSE_SINK')
+    .executeTakeFirstOrThrow();
+  return account.id;
+}
+
+interface AdvisoryLockBlocker {
+  release(): void;
+  done: Promise<void>;
+}
+
+async function holdAdvisoryLock(key: number): Promise<AdvisoryLockBlocker> {
+  let markReady!: () => void;
+  let releaseLock!: () => void;
+  let released = false;
+  const ready = new Promise<void>((resolve) => { markReady = resolve; });
+  const release = new Promise<void>((resolve) => { releaseLock = resolve; });
+  const done = database().transaction().execute(async (trx) => {
+    await sql`select pg_advisory_xact_lock(${key})`.execute(trx);
+    markReady();
+    await release;
+  });
+  await ready;
+  return {
+    release(): void {
+      if (!released) {
+        released = true;
+        releaseLock();
+      }
+    },
+    done,
+  };
+}
+
+async function settlementState(promise: Promise<unknown>): Promise<'completed' | 'blocked'> {
+  return Promise.race([
+    promise.then(() => 'completed' as const),
+    new Promise<'blocked'>((resolve) => setTimeout(() => resolve('blocked'), 200)),
+  ]);
+}
+
+async function waitForBlockedQuery(fragment: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const result = await sql<{ count: string }>`
+      select count(*)::text as count
+      from pg_stat_activity
+      where datname = current_database()
+        and wait_event_type = 'Lock'
+        and query like ${`%${fragment}%`}
+    `.execute(database());
+    if (Number(result.rows[0]?.count ?? 0) > 0) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Timed out waiting for blocked query: ${fragment}`);
+}
+
+async function installBudgetUpdateWaitTrigger(): Promise<void> {
+  await sql`
+    create function task4_wait_for_budget_update() returns trigger as $$
+    begin
+      perform pg_advisory_xact_lock(41004);
+      return new;
+    end;
+    $$ language plpgsql;
+    create trigger task4_wait_for_budget_update
+      before update on budget_plans
+      for each row execute function task4_wait_for_budget_update()
+  `.execute(database());
+}
+
+async function removeBudgetUpdateWaitTrigger(): Promise<void> {
+  await sql`
+    drop trigger if exists task4_wait_for_budget_update on budget_plans;
+    drop function if exists task4_wait_for_budget_update()
+  `.execute(database());
+}
+
+async function installCategoryArchiveWaitTrigger(): Promise<void> {
+  await sql`
+    create function task4_wait_for_category_archive() returns trigger as $$
+    begin
+      perform pg_advisory_xact_lock(41005);
+      return new;
+    end;
+    $$ language plpgsql;
+    create trigger task4_wait_for_category_archive
+      before update on categories
+      for each row execute function task4_wait_for_category_archive()
+  `.execute(database());
+}
+
+async function removeCategoryArchiveWaitTrigger(): Promise<void> {
+  await sql`
+    drop trigger if exists task4_wait_for_category_archive on categories;
+    drop function if exists task4_wait_for_category_archive()
+  `.execute(database());
+}
+
+async function installArchiveFailureTrigger(): Promise<void> {
+  await sql`
+    create function task4_fail_budget_account_archive() returns trigger as $$
+    begin
+      if new.kind = 'BUDGET_RESERVE' and new.archived_at is not null then
+        raise exception 'induced archive failure';
+      end if;
+      return new;
+    end;
+    $$ language plpgsql;
+    create trigger task4_fail_budget_account_archive
+      before update on financial_accounts
+      for each row execute function task4_fail_budget_account_archive()
+  `.execute(database());
+}
+
+async function removeArchiveFailureTrigger(): Promise<void> {
+  await sql`
+    drop trigger if exists task4_fail_budget_account_archive on financial_accounts;
+    drop function if exists task4_fail_budget_account_archive()
+  `.execute(database());
 }
 
 async function createDatabaseTestContext(): Promise<DatabaseTestContext> {

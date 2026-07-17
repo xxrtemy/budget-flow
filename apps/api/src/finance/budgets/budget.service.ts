@@ -17,10 +17,20 @@ import type {
 import { assertMoneyMinor } from '../domain/money';
 import { AccountRepository } from '../ledger/account.repository';
 import { LedgerService } from '../ledger/ledger.service';
+import {
+  decodeListCursor,
+  encodeListCursor,
+  listCursorTimestamp,
+} from '../shared/list-cursor';
 import { calculateBudgetOccurrences } from './budget-calculator';
+import {
+  lockActiveBudgetPlan,
+  lockActiveCategory,
+  lockAllActiveBudgetPlans,
+  releaseAndArchiveBudgetPlans,
+} from './budget-locking';
 
 const PAGE_SIZE = 50;
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SCHEDULE_CADENCES = new Set<ScheduleCadence>([
   'DAILY',
   'WEEKLY',
@@ -57,11 +67,6 @@ export interface BudgetPlan {
   updatedAt: Date;
 }
 
-interface BudgetCursor {
-  createdAtMicros: string;
-  id: string;
-}
-
 type DatabaseExecutor = Kysely<Database> | Transaction<Database>;
 
 @Injectable()
@@ -80,7 +85,7 @@ export class BudgetService {
     validateCadence(input.cadence);
 
     return this.db.transaction().execute(async (trx) => {
-      await assertCategory(input.userId, input.categoryId, trx);
+      await lockActiveCategory(input.userId, input.categoryId, trx);
       const id = randomUUID();
       const reserveAccountId = randomUUID();
       const row = await trx.insertInto('budget_plans').values({
@@ -120,7 +125,7 @@ export class BudgetService {
     items: BudgetPlan[];
     nextCursor: string | null;
   }> {
-    const decoded = cursor ? decodeCursor(cursor) : undefined;
+    const decoded = cursor ? decodeListCursor(cursor) : undefined;
     let query = budgetPlanQuery(this.db, userId)
       .select(
         sql<string>`((extract(epoch from budget_plans.created_at) * 1000000)::bigint)::text`
@@ -128,7 +133,7 @@ export class BudgetService {
       )
       .where('budget_plans.archived_at', 'is', null);
     if (decoded) {
-      const createdAt = microsToTimestamp(decoded.createdAtMicros);
+      const createdAt = listCursorTimestamp(decoded.createdAtMicros);
       query = query.where(({ and, eb, or }) => or([
         eb('budget_plans.created_at', '<', createdAt),
         and([
@@ -146,7 +151,7 @@ export class BudgetService {
     return {
       items: pageRows.map((row) => toBudgetPlan(row, row.reserve_account_id)),
       nextCursor: rows.length > PAGE_SIZE && last
-        ? encodeCursor({
+        ? encodeListCursor({
             createdAtMicros: last.cursor_created_at_micros,
             id: last.id,
           })
@@ -177,49 +182,36 @@ export class BudgetService {
       throw new BadRequestException('Budget plan patch contains an unsupported field');
     }
 
-    const row = await this.db.updateTable('budget_plans').set({
-      ...(patch.amountMinor === undefined
-        ? {}
-        : { amount_minor: sql<never>`${patch.amountMinor}::bigint` }),
-      ...(patch.startsOn === undefined ? {} : { starts_on: patch.startsOn }),
-      ...(patch.cadence === undefined ? {} : { cadence: patch.cadence }),
-      updated_at: now,
-    }).where('user_id', '=', userId)
-      .where('id', '=', id)
-      .where('archived_at', 'is', null)
-      .returningAll()
-      .executeTakeFirst();
-    if (!row) {
-      throw new NotFoundException('Budget plan not found');
-    }
-    const account = await this.db.selectFrom('financial_accounts')
-      .select('id')
-      .where('user_id', '=', userId)
-      .where('kind', '=', 'BUDGET_RESERVE')
-      .where('reference_id', '=', id)
-      .executeTakeFirstOrThrow();
-    return toBudgetPlan(row, account.id);
+    return this.db.transaction().execute(async (trx) => {
+      await lockActiveBudgetPlan(userId, id, trx);
+      const row = await trx.updateTable('budget_plans').set({
+        ...(patch.amountMinor === undefined
+          ? {}
+          : { amount_minor: sql<never>`${patch.amountMinor}::bigint` }),
+        ...(patch.startsOn === undefined ? {} : { starts_on: patch.startsOn }),
+        ...(patch.cadence === undefined ? {} : { cadence: patch.cadence }),
+        updated_at: now,
+      }).where('user_id', '=', userId)
+        .where('id', '=', id)
+        .where('archived_at', 'is', null)
+        .returningAll()
+        .executeTakeFirstOrThrow();
+      const account = await trx.selectFrom('financial_accounts')
+        .select('id')
+        .where('user_id', '=', userId)
+        .where('kind', '=', 'BUDGET_RESERVE')
+        .where('reference_id', '=', id)
+        .where('archived_at', 'is', null)
+        .executeTakeFirstOrThrow();
+      return toBudgetPlan(row, account.id);
+    });
   }
 
   async archive(userId: string, id: string): Promise<void> {
     await this.db.transaction().execute(async (trx) => {
       const now = new Date();
-      const row = await trx.updateTable('budget_plans')
-        .set({ archived_at: now, updated_at: now })
-        .where('user_id', '=', userId)
-        .where('id', '=', id)
-        .where('archived_at', 'is', null)
-        .returning('id')
-        .executeTakeFirst();
-      if (!row) {
-        throw new NotFoundException('Budget plan not found');
-      }
-      await trx.updateTable('financial_accounts')
-        .set({ archived_at: now })
-        .where('user_id', '=', userId)
-        .where('kind', '=', 'BUDGET_RESERVE')
-        .where('reference_id', '=', id)
-        .execute();
+      const plan = await lockActiveBudgetPlan(userId, id, trx);
+      await releaseAndArchiveBudgetPlans(userId, [plan], now, trx);
     });
   }
 
@@ -254,12 +246,7 @@ export class BudgetService {
     if (!period) {
       throw new NotFoundException('Calculation period not found');
     }
-    const plans = await trx.selectFrom('budget_plans')
-      .selectAll()
-      .where('user_id', '=', userId)
-      .where('archived_at', 'is', null)
-      .orderBy('id')
-      .execute();
+    const plans = await lockAllActiveBudgetPlans(userId, trx);
     if (plans.length === 0) {
       return;
     }
@@ -359,22 +346,6 @@ function budgetPlanQuery(executor: DatabaseExecutor, userId: string) {
     .where('budget_plans.user_id', '=', userId);
 }
 
-async function assertCategory(
-  userId: string,
-  categoryId: string,
-  executor: DatabaseExecutor,
-): Promise<void> {
-  const category = await executor.selectFrom('categories')
-    .select('id')
-    .where('user_id', '=', userId)
-    .where('id', '=', categoryId)
-    .where('archived_at', 'is', null)
-    .executeTakeFirst();
-  if (!category) {
-    throw new NotFoundException('Category not found');
-  }
-}
-
 function toBudgetPlan(row: {
   id: string;
   user_id: string;
@@ -441,37 +412,4 @@ function parseMoney(value: string): number {
     throw new Error('Stored budget amount exceeds the safe integer range');
   }
   return parsed;
-}
-
-function encodeCursor(cursor: BudgetCursor): string {
-  return Buffer.from(JSON.stringify(cursor)).toString('base64url');
-}
-
-function decodeCursor(cursor: string): BudgetCursor {
-  try {
-    const value = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as {
-      createdAtMicros?: unknown;
-      id?: unknown;
-    };
-    if (typeof value.createdAtMicros !== 'string'
-      || !/^[1-9][0-9]{0,15}$/.test(value.createdAtMicros)
-      || BigInt(value.createdAtMicros) > BigInt(Number.MAX_SAFE_INTEGER)
-      || typeof value.id !== 'string'
-      || !UUID_PATTERN.test(value.id)
-      || encodeCursor({ createdAtMicros: value.createdAtMicros, id: value.id }) !== cursor) {
-      throw new Error('Invalid cursor');
-    }
-    return { createdAtMicros: value.createdAtMicros, id: value.id };
-  } catch {
-    throw new BadRequestException('Invalid budget cursor');
-  }
-}
-
-function microsToTimestamp(value: string) {
-  const micros = BigInt(value);
-  return sql<Date>`
-    timestamptz 'epoch'
-    + ${(micros / 1_000_000n).toString()}::bigint * interval '1 second'
-    + ${(micros % 1_000_000n).toString()}::integer * interval '1 microsecond'
-  `;
 }

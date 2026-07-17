@@ -10,9 +10,17 @@ import { sql, type Kysely } from 'kysely';
 
 import { DATABASE } from '../../database/database.constants';
 import type { Database } from '../../database/database.types';
+import {
+  lockActiveCategoryPlans,
+  releaseAndArchiveBudgetPlans,
+} from '../budgets/budget-locking';
+import {
+  decodeListCursor,
+  encodeListCursor,
+  listCursorTimestamp,
+} from '../shared/list-cursor';
 
 const PAGE_SIZE = 50;
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export interface Category {
   id: string;
@@ -21,11 +29,6 @@ export interface Category {
   archivedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
-}
-
-interface CategoryCursor {
-  createdAtMicros: string;
-  id: string;
 }
 
 @Injectable()
@@ -47,7 +50,7 @@ export class CategoryService {
     items: Category[];
     nextCursor: string | null;
   }> {
-    const decoded = cursor ? decodeCursor(cursor) : undefined;
+    const decoded = cursor ? decodeListCursor(cursor) : undefined;
     let query = this.db.selectFrom('categories')
       .selectAll()
       .select(
@@ -57,7 +60,7 @@ export class CategoryService {
       .where('user_id', '=', userId)
       .where('archived_at', 'is', null);
     if (decoded) {
-      const createdAt = microsToTimestamp(decoded.createdAtMicros);
+      const createdAt = listCursorTimestamp(decoded.createdAtMicros);
       query = query.where(({ and, eb, or }) => or([
         eb('created_at', '<', createdAt),
         and([
@@ -75,7 +78,7 @@ export class CategoryService {
     return {
       items: pageRows.map(toCategory),
       nextCursor: rows.length > PAGE_SIZE && last
-        ? encodeCursor({
+        ? encodeListCursor({
             createdAtMicros: last.cursor_created_at_micros,
             id: last.id,
           })
@@ -98,16 +101,21 @@ export class CategoryService {
   }
 
   async archive(userId: string, id: string): Promise<void> {
-    const row = await this.db.updateTable('categories')
-      .set({ archived_at: new Date(), updated_at: new Date() })
-      .where('user_id', '=', userId)
-      .where('id', '=', id)
-      .where('archived_at', 'is', null)
-      .returning('id')
-      .executeTakeFirst();
-    if (!row) {
-      throw new NotFoundException('Category not found');
-    }
+    await this.db.transaction().execute(async (trx) => {
+      const now = new Date();
+      const plans = await lockActiveCategoryPlans(userId, id, trx);
+      await releaseAndArchiveBudgetPlans(userId, plans, now, trx);
+      const row = await trx.updateTable('categories')
+        .set({ archived_at: now, updated_at: now })
+        .where('user_id', '=', userId)
+        .where('id', '=', id)
+        .where('archived_at', 'is', null)
+        .returning('id')
+        .executeTakeFirst();
+      if (!row) {
+        throw new NotFoundException('Category not found');
+      }
+    });
   }
 }
 
@@ -134,37 +142,4 @@ function toCategory(row: {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
-}
-
-function encodeCursor(cursor: CategoryCursor): string {
-  return Buffer.from(JSON.stringify(cursor)).toString('base64url');
-}
-
-function decodeCursor(cursor: string): CategoryCursor {
-  try {
-    const value = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as {
-      createdAtMicros?: unknown;
-      id?: unknown;
-    };
-    if (typeof value.createdAtMicros !== 'string'
-      || !/^[1-9][0-9]{0,15}$/.test(value.createdAtMicros)
-      || BigInt(value.createdAtMicros) > BigInt(Number.MAX_SAFE_INTEGER)
-      || typeof value.id !== 'string'
-      || !UUID_PATTERN.test(value.id)
-      || encodeCursor({ createdAtMicros: value.createdAtMicros, id: value.id }) !== cursor) {
-      throw new Error('Invalid cursor');
-    }
-    return { createdAtMicros: value.createdAtMicros, id: value.id };
-  } catch {
-    throw new BadRequestException('Invalid category cursor');
-  }
-}
-
-function microsToTimestamp(value: string) {
-  const micros = BigInt(value);
-  return sql<Date>`
-    timestamptz 'epoch'
-    + ${(micros / 1_000_000n).toString()}::bigint * interval '1 second'
-    + ${(micros % 1_000_000n).toString()}::integer * interval '1 microsecond'
-  `;
 }

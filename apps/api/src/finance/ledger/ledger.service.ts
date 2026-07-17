@@ -297,9 +297,11 @@ export class LedgerService {
     }
 
     const transactionIds = rows.map(({ id }) => id);
+    const userId = rows[0]!.user_id;
     const postingRows = await executor
       .selectFrom('ledger_postings')
       .selectAll()
+      .where('user_id', '=', userId)
       .where('transaction_id', 'in', transactionIds)
       .orderBy('created_at')
       .orderBy('id')

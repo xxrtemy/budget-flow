@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   Inject,
   Injectable,
   NotFoundException,
@@ -8,6 +9,7 @@ import { sql, type Kysely } from 'kysely';
 
 import { DATABASE } from '../../database/database.constants';
 import type { Database } from '../../database/database.types';
+import { lockActiveCategory } from '../budgets/budget-locking';
 import { assertMoneyMinor } from '../domain/money';
 import { AccountRepository } from '../ledger/account.repository';
 import { LedgerService } from '../ledger/ledger.service';
@@ -15,11 +17,13 @@ import type {
   LedgerPosting,
   LedgerTransaction,
 } from '../ledger/ledger.types';
+import {
+  decodeListCursor,
+  encodeListCursor,
+  listCursorTimestamp,
+} from '../shared/list-cursor';
 
 const PAGE_SIZE = 50;
-const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
-const CURSOR_MICROS_PATTERN = /^[1-9][0-9]{0,15}$/;
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export interface CreateExpenseInput {
   userId: string;
@@ -41,11 +45,6 @@ export interface Expense {
   createdAt: Date;
 }
 
-interface ExpenseCursor {
-  createdAtMicros: string;
-  id: string;
-}
-
 @Injectable()
 export class ExpenseService {
   private readonly ledger: LedgerService;
@@ -62,16 +61,7 @@ export class ExpenseService {
     const description = validateDescription(input.description);
 
     return this.db.transaction().execute(async (trx) => {
-      const category = await trx.selectFrom('categories')
-        .select('id')
-        .where('user_id', '=', input.userId)
-        .where('id', '=', input.categoryId)
-        .where('archived_at', 'is', null)
-        .forUpdate()
-        .executeTakeFirst();
-      if (!category) {
-        throw new NotFoundException('Category not found');
-      }
+      await lockActiveCategory(input.userId, input.categoryId, trx);
       const reserveAccounts = await trx.selectFrom('financial_accounts')
         .innerJoin('budget_plans', (join) => join
           .onRef('budget_plans.id', '=', 'financial_accounts.reference_id')
@@ -106,7 +96,7 @@ export class ExpenseService {
         account.balanceMinor,
       ]));
       let remainingExpense = input.amountMinor;
-      let remainingReserve = 0;
+      let remainingReserve = 0n;
       const reservePostings: Array<{ accountId: string; amountMinor: number }> = [];
       for (const account of reserveAccounts) {
         const balance = Math.max(0, balanceById.get(account.id) ?? 0);
@@ -115,8 +105,9 @@ export class ExpenseService {
           reservePostings.push({ accountId: account.id, amountMinor: -consumed });
           remainingExpense -= consumed;
         }
-        remainingReserve += balance - consumed;
+        remainingReserve += BigInt(balance - consumed);
       }
+      const remainingReserveMinor = safeReserveAggregate(remainingReserve);
       const postings = [
         ...reservePostings,
         ...(remainingExpense > 0
@@ -131,7 +122,7 @@ export class ExpenseService {
         metadata: {
           categoryId: input.categoryId,
           ...(description === null ? {} : { description }),
-          remainingCategoryReserveMinor: remainingReserve,
+          remainingCategoryReserveMinor: remainingReserveMinor,
         },
         postings,
       }, trx);
@@ -140,7 +131,7 @@ export class ExpenseService {
         input.categoryId,
         input.amountMinor,
         description,
-        remainingReserve,
+        remainingReserveMinor,
       );
     });
   }
@@ -149,7 +140,7 @@ export class ExpenseService {
     items: Expense[];
     nextCursor: string | null;
   }> {
-    const decoded = cursor ? decodeCursor(cursor) : undefined;
+    const decoded = cursor ? decodeListCursor(cursor) : undefined;
     let query = this.db.selectFrom('ledger_transactions')
       .selectAll()
       .select(
@@ -159,12 +150,7 @@ export class ExpenseService {
       .where('user_id', '=', userId)
       .where('type', '=', 'ORDINARY_EXPENSE');
     if (decoded) {
-      const cursorMicros = BigInt(decoded.createdAtMicros);
-      const cursorTimestamp = sql<Date>`
-        timestamptz 'epoch'
-        + ${(cursorMicros / 1_000_000n).toString()}::bigint * interval '1 second'
-        + ${(cursorMicros % 1_000_000n).toString()}::integer * interval '1 microsecond'
-      `;
+      const cursorTimestamp = listCursorTimestamp(decoded.createdAtMicros);
       query = query.where(({ and, eb, or }) => or([
         eb('created_at', '<', cursorTimestamp),
         and([
@@ -183,6 +169,7 @@ export class ExpenseService {
       ? []
       : await this.db.selectFrom('ledger_postings')
           .selectAll()
+          .where('user_id', '=', userId)
           .where('transaction_id', 'in', transactionIds)
           .orderBy('created_at')
           .orderBy('id')
@@ -203,9 +190,9 @@ export class ExpenseService {
     const items = pageRows.map((row) => {
       const metadata = row.metadata as Record<string, unknown>;
       const postings = postingsByTransaction.get(row.id) ?? [];
-      const amountMinor = postings
+      const amountMinor = safeExpenseAggregate(postings
         .filter(({ amountMinor }) => amountMinor > 0)
-        .reduce((sum, posting) => sum + posting.amountMinor, 0);
+        .map(({ amountMinor }) => amountMinor));
       const transaction: LedgerTransaction = {
         id: row.id,
         userId: row.user_id,
@@ -229,7 +216,7 @@ export class ExpenseService {
     return {
       items,
       nextCursor: rows.length > PAGE_SIZE && last
-        ? encodeCursor({
+        ? encodeListCursor({
             createdAtMicros: last.cursor_created_at_micros,
             id: last.id,
           })
@@ -320,29 +307,17 @@ function requiredMetadataMoney(metadata: Record<string, unknown>, field: string)
   return value;
 }
 
-function encodeCursor(cursor: ExpenseCursor): string {
-  return Buffer.from(JSON.stringify(cursor)).toString('base64url');
+function safeReserveAggregate(value: bigint): number {
+  if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new ConflictException('Category reserve balance exceeds the safe integer range');
+  }
+  return Number(value);
 }
 
-function decodeCursor(cursor: string): ExpenseCursor {
-  try {
-    if (!BASE64URL_PATTERN.test(cursor)) {
-      throw new Error('Invalid cursor');
-    }
-    const value = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as {
-      createdAtMicros?: unknown;
-      id?: unknown;
-    };
-    if (typeof value.createdAtMicros !== 'string'
-      || !CURSOR_MICROS_PATTERN.test(value.createdAtMicros)
-      || BigInt(value.createdAtMicros) > BigInt(Number.MAX_SAFE_INTEGER)
-      || typeof value.id !== 'string'
-      || !UUID_PATTERN.test(value.id)
-      || encodeCursor({ createdAtMicros: value.createdAtMicros, id: value.id }) !== cursor) {
-      throw new Error('Invalid cursor');
-    }
-    return { createdAtMicros: value.createdAtMicros, id: value.id };
-  } catch {
-    throw new BadRequestException('Invalid expense cursor');
+function safeExpenseAggregate(values: readonly number[]): number {
+  const total = values.reduce((sum, value) => sum + BigInt(value), 0n);
+  if (total > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new ConflictException('Expense amount exceeds the safe integer range');
   }
+  return Number(total);
 }
