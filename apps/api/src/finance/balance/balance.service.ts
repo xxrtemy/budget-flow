@@ -4,7 +4,7 @@ import { sql, type Kysely } from 'kysely';
 import { DATABASE } from '../../database/database.constants';
 import type { AccountKind, Database } from '../../database/database.types';
 import type { CalculationPeriod } from '../profile/profile.types';
-import type { ReconciliationService } from '../settlement/reconciliation.service';
+import { ReconciliationService } from '../settlement/reconciliation.service';
 import type { SettlementOffer } from '../settlement/settlement.service';
 
 const ASSET_KINDS: AccountKind[] = [
