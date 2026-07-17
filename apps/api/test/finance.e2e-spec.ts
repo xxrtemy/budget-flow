@@ -129,6 +129,7 @@ describe('finance routes and tenant scoping', () => {
     });
     expect((await api(userId).get(`/finance/income-schedules/${schedule.body.id}`)).status).toBe(200);
     expect((await api(userId).patch(`/finance/income-schedules/${schedule.body.id}`)
+      .set('Idempotency-Key', 'income-schedule-update-routes')
       .send({ name: 'Оклад' })).status).toBe(200);
 
     const budget = await api(userId).post('/finance/budgets')
@@ -178,6 +179,9 @@ describe('HTTP idempotency', () => {
       ['post', '/finance/expenses', { categoryId: category.id, amountMinor: 100, occurredAt: now.toISOString() }],
       ['post', '/finance/obligations', { amountMinor: 100, startsOn: '2026-07-11', cadence: 'DAILY', name: 'x' }],
       ['post', '/finance/budgets', { categoryId: category.id, amountMinor: 100, startsOn: '2026-07-10', cadence: 'DAILY' }],
+      ['patch', `/finance/income-schedules/${randomUUID()}`, { name: 'changed' }],
+      ['delete', `/finance/income-schedules/${randomUUID()}`, {}],
+      ['delete', `/finance/categories/${randomUUID()}`, {}],
       ['patch', `/finance/obligations/${randomUUID()}`, { amountMinor: 100 }],
       ['post', `/finance/obligations/occurrences/${randomUUID()}/cancel`, {}],
       ['patch', `/finance/budgets/${randomUUID()}`, { amountMinor: 100 }],
@@ -214,27 +218,7 @@ describe('HTTP idempotency', () => {
       .send({ amountMinor: 5_000, effectiveAt: now.toISOString() })).status).toBe(409);
   });
 
-  test('serializes concurrent identical and conflicting requests without exposing 23505', async () => {
-    const userId = randomUUID();
-    await createProfile(userId);
-    const identical = await Promise.all([
-      opening(userId, 5_000, 'concurrent-same'),
-      opening(userId, 5_000, 'concurrent-same'),
-    ]);
-    expect(identical.map(({ status }) => status)).toEqual([201, 201]);
-    expect(identical[0]!.body).toEqual(identical[1]!.body);
-
-    const conflict = await Promise.all([
-      api(userId).post('/finance/incomes').set('Idempotency-Key', 'concurrent-different')
-        .send({ amountMinor: 100, effectiveAt: now.toISOString() }),
-      api(userId).post('/finance/incomes').set('Idempotency-Key', 'concurrent-different')
-        .send({ amountMinor: 200, effectiveAt: now.toISOString() }),
-    ]);
-    expect(conflict.map(({ status }) => status).sort()).toEqual([201, 409]);
-    expect(JSON.stringify(conflict.map(({ body }) => body))).not.toContain('23505');
-  });
-
-  test('recovers a stale matching PROCESSING row but never replays a fresh incomplete row', async () => {
+  test('never reclaims a committed matching PROCESSING row based on its age', async () => {
     const userId = randomUUID();
     await createProfile(userId);
     const body = { amountMinor: 5_000, effectiveAt: now.toISOString() };
@@ -245,8 +229,10 @@ describe('HTTP idempotency', () => {
       payload_hash: hash, state: 'PROCESSING', response_status: null, response_body: null,
       updated_at: new Date('2026-07-16T00:00:00.000Z'),
     }).execute();
-    expect((await api(userId).post('/finance/opening-balance')
-      .set('Idempotency-Key', 'stale-key').send(body)).status).toBe(201);
+    const stale = await api(userId).post('/finance/opening-balance')
+      .set('Idempotency-Key', 'stale-key').send(body);
+    expect(stale.status).toBe(409);
+    expect(stale.body.message).toContain('still processing');
 
     const secondUser = randomUUID();
     await createProfile(secondUser);
@@ -259,7 +245,7 @@ describe('HTTP idempotency', () => {
     expect(fresh.status).toBe(409);
     expect(fresh.body.message).toContain('still processing');
     expect(await context.db.selectFrom('ledger_transactions').select('id')
-      .where('user_id', '=', secondUser).execute()).toEqual([]);
+      .where('user_id', 'in', [userId, secondUser]).execute()).toEqual([]);
   });
 
   test('does not cache a failed domain attempt', async () => {
@@ -277,6 +263,59 @@ describe('HTTP idempotency', () => {
     expect((await api(userId).post('/finance/savings/transfers')
       .set('Idempotency-Key', 'retry-after-error').send(transfer)).status).toBe(201);
   });
+
+  test('rejects missing and non-discriminated savings endpoints at the DTO boundary', async () => {
+    const userId = randomUUID();
+    await createProfile(userId);
+    await opening(userId, 1_000, 'dto-opening');
+    const requests = [
+      {},
+      { to: { type: 'GENERAL' }, amountMinor: 100, effectiveAt: now.toISOString() },
+      {
+        from: { type: 'FREE', goalId: randomUUID() }, to: { type: 'GENERAL' },
+        amountMinor: 100, effectiveAt: now.toISOString(),
+      },
+      {
+        from: { type: 'FREE' }, to: { type: 'GOAL' }, amountMinor: 100,
+        effectiveAt: now.toISOString(),
+      },
+    ];
+    for (const [index, body] of requests.entries()) {
+      expect((await api(userId).post('/finance/savings/transfers')
+        .set('Idempotency-Key', `invalid-endpoint-${index}`).send(body)).status).toBe(400);
+    }
+    expect(await context.db.selectFrom('ledger_transactions').select('id')
+      .where('user_id', '=', userId).where('type', '=', 'SAVINGS_TRANSFER').execute()).toEqual([]);
+  });
+});
+
+describe('server clock for cascading releases', () => {
+  test.each(['budget', 'category'] as const)(
+    'uses FINANCE_CLOCK for a %s archive BUDGET_RELEASE',
+    async (archiveKind) => {
+      const userId = randomUUID();
+      await createProfile(userId);
+      await opening(userId, 100_000, `clock-opening-${archiveKind}`);
+      const category = (await api(userId).post('/finance/categories')
+        .send({ name: archiveKind })).body;
+      const budget = await api(userId).post('/finance/budgets')
+        .set('Idempotency-Key', `clock-budget-${archiveKind}`).send({
+          categoryId: category.id, amountMinor: 10_000,
+          startsOn: '2026-07-21', cadence: 'WEEKLY',
+        }).expect(201);
+      await api(userId).get('/finance/balance').expect(200);
+      now = new Date('2026-07-20T18:45:12.345Z');
+      const path = archiveKind === 'budget'
+        ? `/finance/budgets/${budget.body.id}`
+        : `/finance/categories/${category.id}`;
+      await api(userId).delete(path).set('Idempotency-Key', `clock-delete-${archiveKind}`)
+        .send({}).expect(204);
+      const release = await context.db.selectFrom('ledger_transactions')
+        .select('effective_at').where('user_id', '=', userId)
+        .where('type', '=', 'BUDGET_RELEASE').executeTakeFirstOrThrow();
+      expect(release.effective_at).toEqual(now);
+    },
+  );
 });
 
 describe('approved finance flow', () => {

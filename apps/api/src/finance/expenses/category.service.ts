@@ -5,11 +5,13 @@ import {
   Inject,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { sql, type Kysely } from 'kysely';
 
 import { DATABASE } from '../../database/database.constants';
 import type { Database } from '../../database/database.types';
+import { FinanceTransactionContext } from '../transaction/finance-transaction-context';
 import {
   lockActiveCategoryPlans,
   releaseAndArchiveBudgetPlans,
@@ -33,11 +35,18 @@ export interface Category {
 
 @Injectable()
 export class CategoryService {
-  constructor(@Inject(DATABASE) private readonly db: Kysely<Database>) {}
+  private readonly transactions: FinanceTransactionContext;
+
+  constructor(
+    @Inject(DATABASE) private readonly db: Kysely<Database>,
+    @Optional() transactions?: FinanceTransactionContext,
+  ) {
+    this.transactions = transactions ?? new FinanceTransactionContext();
+  }
 
   async create(userId: string, name: string): Promise<Category> {
     const normalizedName = validateName(name);
-    return this.db.transaction().execute(async (trx) => {
+    return this.transactions.inTransaction(this.db, async (trx) => {
       const profile = await trx.selectFrom('financial_profiles').select('user_id')
         .where('user_id', '=', userId).forUpdate().executeTakeFirst();
       if (!profile) throw new NotFoundException('Financial profile not found');
@@ -105,9 +114,11 @@ export class CategoryService {
     return toCategory(row);
   }
 
-  async archive(userId: string, id: string): Promise<void> {
-    await this.db.transaction().execute(async (trx) => {
-      const now = new Date();
+  async archive(userId: string, id: string, now: Date = new Date()): Promise<void> {
+    if (!(now instanceof Date) || Number.isNaN(now.getTime())) {
+      throw new BadRequestException('now must be a valid Date');
+    }
+    await this.transactions.inTransaction(this.db, async (trx) => {
       const plans = await lockActiveCategoryPlans(userId, id, trx);
       await releaseAndArchiveBudgetPlans(userId, plans, now, trx);
       const row = await trx.updateTable('categories')

@@ -6,6 +6,7 @@ import {
   Inject,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { DateTime } from 'luxon';
 import { sql, type Kysely, type Selectable, type Transaction } from 'kysely';
@@ -23,6 +24,7 @@ import {
   listCursorTimestamp,
 } from '../shared/list-cursor';
 import type { PeriodCloser } from './reconciliation.service';
+import { FinanceTransactionContext } from '../transaction/finance-transaction-context';
 
 const PAGE_SIZE = 50;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -53,13 +55,16 @@ export interface AcceptSettlementOfferInput {
 export class SettlementService implements PeriodCloser {
   private readonly ledger: LedgerService;
   private readonly accounts: AccountRepository;
+  private readonly transactions: FinanceTransactionContext;
 
   constructor(
     @Inject(DATABASE) private readonly db: Kysely<Database>,
     private readonly budgets: BudgetService,
+    @Optional() transactions?: FinanceTransactionContext,
   ) {
     this.ledger = new LedgerService(db);
     this.accounts = new AccountRepository(db);
+    this.transactions = transactions ?? new FinanceTransactionContext();
   }
 
   async closeDuePeriods(
@@ -73,7 +78,10 @@ export class SettlementService implements PeriodCloser {
       await this.closeOne(userId, now, trx);
       return;
     }
-    await this.db.transaction().execute((transaction) => this.closeOne(userId, now, transaction));
+    await this.transactions.inTransaction(
+      this.db,
+      (transaction) => this.closeOne(userId, now, transaction),
+    );
   }
 
   async listOffers(userId: string, cursor?: string): Promise<{
@@ -107,7 +115,7 @@ export class SettlementService implements PeriodCloser {
 
   async acceptOffer(input: AcceptSettlementOfferInput): Promise<SettlementOffer> {
     validateAcceptInput(input);
-    return this.db.transaction().execute(async (trx) => {
+    return this.transactions.inTransaction(this.db, async (trx) => {
       const offer = await trx.selectFrom('settlement_offers').selectAll()
         .where('user_id', '=', input.userId).where('id', '=', input.offerId)
         .forUpdate().executeTakeFirst();

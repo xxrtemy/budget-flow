@@ -4,12 +4,14 @@ import {
   Inject,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { sql, type Kysely } from 'kysely';
 
 import { DATABASE } from '../../database/database.constants';
 import type { Database } from '../../database/database.types';
 import { lockActiveCategory } from '../budgets/budget-locking';
+import { FinanceTransactionContext } from '../transaction/finance-transaction-context';
 import { assertMoneyMinor } from '../domain/money';
 import { AccountRepository } from '../ledger/account.repository';
 import { LedgerService } from '../ledger/ledger.service';
@@ -49,10 +51,15 @@ export interface Expense {
 export class ExpenseService {
   private readonly ledger: LedgerService;
   private readonly accounts: AccountRepository;
+  private readonly transactions: FinanceTransactionContext;
 
-  constructor(@Inject(DATABASE) private readonly db: Kysely<Database>) {
+  constructor(
+    @Inject(DATABASE) private readonly db: Kysely<Database>,
+    @Optional() transactions?: FinanceTransactionContext,
+  ) {
     this.ledger = new LedgerService(db);
     this.accounts = new AccountRepository(db);
+    this.transactions = transactions ?? new FinanceTransactionContext();
   }
 
   async create(input: CreateExpenseInput): Promise<Expense> {
@@ -60,7 +67,7 @@ export class ExpenseService {
     validateDate(input.occurredAt);
     const description = validateDescription(input.description);
 
-    return this.db.transaction().execute(async (trx) => {
+    return this.transactions.inTransaction(this.db, async (trx) => {
       await lockActiveCategory(input.userId, input.categoryId, trx);
       const reserveAccounts = await trx.selectFrom('financial_accounts')
         .innerJoin('budget_plans', (join) => join

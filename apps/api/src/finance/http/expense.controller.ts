@@ -1,7 +1,8 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, ParseUUIDPipe, Patch, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, Inject, Param, ParseUUIDPipe, Patch, Post, Query } from '@nestjs/common';
 
 import { CategoryService } from '../expenses/category.service';
 import { ExpenseService } from '../expenses/expense.service';
+import { FINANCE_CLOCK, type FinanceClock } from '../finance.constants';
 import { CurrentUserId } from './current-user.decorator';
 import { CurrentUserPipe } from './current-user.pipe';
 import { CategoryDto } from './dto/category.dto';
@@ -13,7 +14,11 @@ const UUID = new ParseUUIDPipe();
 
 @Controller('finance')
 export class ExpenseController {
-  constructor(private readonly categories: CategoryService, private readonly expenses: ExpenseService) {}
+  constructor(
+    private readonly categories: CategoryService,
+    private readonly expenses: ExpenseService,
+    @Inject(FINANCE_CLOCK) private readonly clock: FinanceClock,
+  ) {}
 
   @Post('expenses') @Idempotent()
   createExpense(@CurrentUserId(CurrentUserPipe) userId: string, @Body() dto: CreateExpenseDto,
@@ -43,9 +48,9 @@ export class ExpenseController {
     return this.categories.update(userId, id, dto.name);
   }
 
-  @Delete('categories/:id') @HttpCode(204)
+  @Delete('categories/:id') @HttpCode(204) @Idempotent()
   async deleteCategory(@CurrentUserId(CurrentUserPipe) userId: string, @Param('id', UUID) id: string,
     @Body() _body: EmptyDto, @Query() _query: EmptyDto) {
-    await this.categories.archive(userId, id);
+    await this.categories.archive(userId, id, this.clock());
   }
 }

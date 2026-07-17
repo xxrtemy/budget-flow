@@ -32,6 +32,7 @@ import { SavingsService } from './savings/savings.service';
 import { PERIOD_CLOSER, ReconciliationService } from './settlement/reconciliation.service';
 import { ReconciliationScheduler } from './settlement/reconciliation.scheduler';
 import { SettlementService } from './settlement/settlement.service';
+import { FinanceTransactionContext } from './transaction/finance-transaction-context';
 
 @Module({
   imports: [DatabaseModule, ScheduleModule.forRoot()],
@@ -42,6 +43,7 @@ import { SettlementService } from './settlement/settlement.service';
   ],
   providers: [
     { provide: FINANCE_CLOCK, useFactory: (): FinanceClock => () => new Date() },
+    FinanceTransactionContext,
     LedgerService,
     BudgetService,
     CategoryService,
@@ -57,13 +59,15 @@ import { SettlementService } from './settlement/settlement.service';
     },
     {
       provide: IncomeService,
-      inject: [DATABASE, FINANCE_CLOCK],
-      useFactory: (db: Kysely<Database>, clock: FinanceClock) => new IncomeService(db, clock),
+      inject: [DATABASE, FINANCE_CLOCK, FinanceTransactionContext],
+      useFactory: (db: Kysely<Database>, clock: FinanceClock,
+        transactions: FinanceTransactionContext) => new IncomeService(db, clock, transactions),
     },
     {
       provide: ObligationService,
-      inject: [DATABASE, FINANCE_CLOCK],
-      useFactory: (db: Kysely<Database>, clock: FinanceClock) => new ObligationService(db, clock),
+      inject: [DATABASE, FINANCE_CLOCK, FinanceTransactionContext],
+      useFactory: (db: Kysely<Database>, clock: FinanceClock,
+        transactions: FinanceTransactionContext) => new ObligationService(db, clock, transactions),
     },
     ReconciliationService,
     BalanceService,

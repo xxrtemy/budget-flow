@@ -42,13 +42,13 @@ export class IncomeController {
     return this.incomes.getSchedule(userId, id);
   }
 
-  @Patch('income-schedules/:id')
+  @Patch('income-schedules/:id') @Idempotent()
   updateSchedule(@CurrentUserId(CurrentUserPipe) userId: string, @Param('id', UUID) id: string,
     @Body() dto: UpdateIncomeScheduleDto, @Query() _query: EmptyDto) {
     return this.incomes.updateSchedule(userId, id, dto);
   }
 
-  @Delete('income-schedules/:id') @HttpCode(204)
+  @Delete('income-schedules/:id') @HttpCode(204) @Idempotent()
   async deleteSchedule(@CurrentUserId(CurrentUserPipe) userId: string, @Param('id', UUID) id: string,
     @Body() _body: EmptyDto, @Query() _query: EmptyDto) {
     await this.incomes.archiveSchedule(userId, id);

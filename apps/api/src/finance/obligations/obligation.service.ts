@@ -6,6 +6,7 @@ import {
   Inject,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { DateTime } from 'luxon';
 import type { Kysely, Transaction } from 'kysely';
@@ -16,6 +17,7 @@ import { assertMoneyMinor } from '../domain/money';
 import { localDateToInstant, occurrencesWithin } from '../domain/recurrence';
 import { AccountRepository } from '../ledger/account.repository';
 import { LedgerService } from '../ledger/ledger.service';
+import { FinanceTransactionContext } from '../transaction/finance-transaction-context';
 import { decodeListCursor, encodeListCursor } from '../shared/list-cursor';
 import {
   ObligationRepository,
@@ -90,14 +92,17 @@ export class ObligationService {
   private readonly repository: ObligationRepository;
   private readonly accounts: AccountRepository;
   private readonly ledger: LedgerService;
+  private readonly transactions: FinanceTransactionContext;
 
   constructor(
     @Inject(DATABASE) private readonly db: Kysely<Database>,
     private readonly clock: ObligationClock = () => new Date(),
+    @Optional() transactions?: FinanceTransactionContext,
   ) {
     this.repository = new ObligationRepository(db);
     this.accounts = new AccountRepository(db);
     this.ledger = new LedgerService(db);
+    this.transactions = transactions ?? new FinanceTransactionContext();
   }
 
   async create(input: ObligationScheduleInput): Promise<ObligationSchedule> {
@@ -106,7 +111,7 @@ export class ObligationService {
     validateCadence(input.cadence);
     const name = validateName(input.name);
 
-    return this.db.transaction().execute(async (trx) => {
+    return this.transactions.inTransaction(this.db, async (trx) => {
       await this.requireProfileLock(input.userId, trx);
       const commandTime = validClock(this.clock());
       const schedule = await this.repository.createSchedule({
@@ -157,7 +162,7 @@ export class ObligationService {
     patch: ObligationSchedulePatch,
   ): Promise<ObligationSchedule> {
     const normalized = validatePatch(patch);
-    return this.db.transaction().execute(async (trx) => {
+    return this.transactions.inTransaction(this.db, async (trx) => {
       await this.requireProfileLock(userId, trx);
       const existing = await this.repository.lockSchedule(userId, id, trx);
       if (!existing) throw new NotFoundException('Obligation schedule not found');
@@ -226,7 +231,7 @@ export class ObligationService {
     now: Date,
   ): Promise<ObligationOccurrence> {
     validateDate(now, 'now');
-    return this.db.transaction().execute(async (trx) => {
+    return this.transactions.inTransaction(this.db, async (trx) => {
       await this.requireProfileLock(userId, trx);
       const identity = await trx.selectFrom('schedule_occurrences')
         .select('schedule_id').where('user_id', '=', userId)
@@ -474,7 +479,7 @@ export class ObligationService {
     work: (trx: Transaction<Database>) => Promise<void>,
   ): Promise<void> {
     if (trx) return work(trx);
-    await this.db.transaction().execute(work);
+    await this.transactions.inTransaction(this.db, work);
   }
 }
 

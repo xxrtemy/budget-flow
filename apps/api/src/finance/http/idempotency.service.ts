@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto';
 
-import { ConflictException, Inject, Injectable } from '@nestjs/common';
+import { ConflictException, Inject, Injectable, Optional } from '@nestjs/common';
 import type { Kysely } from 'kysely';
 
 import { DATABASE } from '../../database/database.constants';
 import type { Database, JsonValue } from '../../database/database.types';
+import { FinanceTransactionContext } from '../transaction/finance-transaction-context';
 
 export interface IdempotentRequest {
   userId: string;
@@ -21,15 +22,21 @@ export interface HttpResult<T> {
 
 @Injectable()
 export class IdempotencyService {
-  constructor(@Inject(DATABASE) private readonly db: Kysely<Database>) {}
+  private readonly transactions: FinanceTransactionContext;
+
+  constructor(
+    @Inject(DATABASE) private readonly db: Kysely<Database>,
+    @Optional() transactions?: FinanceTransactionContext,
+  ) {
+    this.transactions = transactions ?? new FinanceTransactionContext();
+  }
 
   async execute<T>(
     request: IdempotentRequest,
     work: () => Promise<HttpResult<T>>,
-    canRetryStale = true,
   ): Promise<HttpResult<T>> {
     try {
-      return await this.db.transaction().execute(async (trx) => {
+      return await this.transactions.startTransaction(this.db, async (trx) => {
         await trx.insertInto('idempotency_records').values({
           id: randomUUID(),
           user_id: request.userId,
@@ -61,7 +68,6 @@ export class IdempotencyService {
         .where('idempotency_key', '=', request.key)
         .executeTakeFirst();
       if (!existing) {
-        if (canRetryStale) return this.execute(request, work, false);
         throw new ConflictException('Idempotency request could not be resolved');
       }
       if (existing.route !== request.route || existing.payload_hash !== request.payloadHash) {
@@ -75,16 +81,6 @@ export class IdempotencyService {
         };
       }
 
-      const staleBefore = new Date(Date.now() - 5 * 60_000);
-      const deleted = await this.db.deleteFrom('idempotency_records')
-        .where('user_id', '=', request.userId)
-        .where('idempotency_key', '=', request.key)
-        .where('state', '=', 'PROCESSING')
-        .where('updated_at', '<', staleBefore)
-        .executeTakeFirst();
-      if (canRetryStale && deleted.numDeletedRows === 1n) {
-        return this.execute(request, work, false);
-      }
       throw new ConflictException('Idempotency request is still processing');
     }
   }

@@ -6,6 +6,7 @@ import {
   Inject,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { sql, type Kysely, type Selectable, type Transaction } from 'kysely';
 
@@ -17,6 +18,7 @@ import type {
   LedgerTransactionsTable,
 } from '../../database/database.types';
 import { assertMoneyMinor } from '../domain/money';
+import { FinanceTransactionContext } from '../transaction/finance-transaction-context';
 import { AccountRepository } from './account.repository';
 import {
   POST_LEDGER_TRANSACTION_TYPES,
@@ -55,9 +57,14 @@ interface InternalPostLedgerInput extends Omit<PostLedgerInput, 'type'> {
 @Injectable()
 export class LedgerService {
   private readonly accounts: AccountRepository;
+  private readonly transactions: FinanceTransactionContext;
 
-  constructor(@Inject(DATABASE) private readonly db: Kysely<Database>) {
+  constructor(
+    @Inject(DATABASE) private readonly db: Kysely<Database>,
+    @Optional() transactions?: FinanceTransactionContext,
+  ) {
     this.accounts = new AccountRepository(db);
+    this.transactions = transactions ?? new FinanceTransactionContext();
   }
 
   async createOpeningBalance(
@@ -67,7 +74,7 @@ export class LedgerService {
   ): Promise<LedgerTransaction> {
     validatePositiveMoney(amountMinor);
 
-    return this.db.transaction().execute(async (trx) => {
+    return this.transactions.inTransaction(this.db, async (trx) => {
       const accounts = await this.accounts.findByKinds(
         userId,
         ['OPENING_EQUITY', 'FREE'],
@@ -100,7 +107,7 @@ export class LedgerService {
     if (trx) {
       return this.insert(input, null, trx);
     }
-    return this.db.transaction().execute((transaction) =>
+    return this.transactions.inTransaction(this.db, (transaction) =>
       this.insert(input, null, transaction));
   }
 
@@ -111,7 +118,7 @@ export class LedgerService {
   ): Promise<LedgerTransaction> {
     validateDate(now);
 
-    return this.db.transaction().execute(async (trx) => {
+    return this.transactions.inTransaction(this.db, async (trx) => {
       const targetRow = await trx
         .selectFrom('ledger_transactions')
         .selectAll()

@@ -43,6 +43,6 @@ export class BudgetController {
   @Delete(':id') @HttpCode(204) @Idempotent()
   async archive(@CurrentUserId(CurrentUserPipe) userId: string, @Param('id', UUID) id: string,
     @Body() _body: EmptyDto, @Query() _query: EmptyDto) {
-    await this.budgets.archive(userId, id);
+    await this.budgets.archive(userId, id, this.clock());
   }
 }

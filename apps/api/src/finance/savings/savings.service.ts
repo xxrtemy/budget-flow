@@ -6,6 +6,7 @@ import {
   Inject,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { sql, type Kysely, type Selectable, type Transaction } from 'kysely';
 
@@ -14,6 +15,7 @@ import type { Database, FinancialAccountsTable } from '../../database/database.t
 import { assertMoneyMinor } from '../domain/money';
 import { AccountRepository, type LockedPostingAccount } from '../ledger/account.repository';
 import { LedgerService } from '../ledger/ledger.service';
+import { FinanceTransactionContext } from '../transaction/finance-transaction-context';
 import type { LedgerTransaction } from '../ledger/ledger.types';
 import {
   decodeListCursor,
@@ -42,10 +44,15 @@ interface ResolvedEndpoint {
 export class SavingsService {
   private readonly accounts: AccountRepository;
   private readonly ledger: LedgerService;
+  private readonly transactions: FinanceTransactionContext;
 
-  constructor(@Inject(DATABASE) private readonly db: Kysely<Database>) {
+  constructor(
+    @Inject(DATABASE) private readonly db: Kysely<Database>,
+    @Optional() transactions?: FinanceTransactionContext,
+  ) {
     this.accounts = new AccountRepository(db);
     this.ledger = new LedgerService(db);
+    this.transactions = transactions ?? new FinanceTransactionContext();
   }
 
   async createGoal(userId: string, input: CreateSavingsGoalInput): Promise<SavingsGoal> {
@@ -54,7 +61,7 @@ export class SavingsService {
     const targetMinor = input.targetMinor === undefined
       ? null
       : validateTarget(input.targetMinor);
-    return this.db.transaction().execute(async (trx) => {
+    return this.transactions.inTransaction(this.db, async (trx) => {
       const profile = await trx.selectFrom('financial_profiles').select('user_id')
         .where('user_id', '=', userId).forUpdate().executeTakeFirst();
       if (!profile) {
@@ -163,7 +170,7 @@ export class SavingsService {
 
   async archiveGoal(userId: string, id: string): Promise<void> {
     validateGoalId(id);
-    await this.db.transaction().execute(async (trx) => {
+    await this.transactions.inTransaction(this.db, async (trx) => {
       const [account] = await this.accounts.lockPostingAccounts(userId, [id], trx);
       assertActiveGoal(account);
       if (account.balanceMinor !== 0n) {
@@ -182,7 +189,7 @@ export class SavingsService {
 
   async transfer(input: SavingsTransferInput): Promise<LedgerTransaction> {
     validateTransfer(input);
-    return this.db.transaction().execute(async (trx) => {
+    return this.transactions.inTransaction(this.db, async (trx) => {
       const [from, to] = await Promise.all([
         this.resolveEndpoint(input.userId, input.from, trx),
         this.resolveEndpoint(input.userId, input.to, trx),

@@ -5,6 +5,7 @@ import {
   Inject,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { DateTime } from 'luxon';
 import type { Kysely, Transaction } from 'kysely';
@@ -12,6 +13,7 @@ import type { Kysely, Transaction } from 'kysely';
 import { DATABASE } from '../../database/database.constants';
 import type { Database, ScheduleCadence } from '../../database/database.types';
 import { assertMoneyMinor } from '../domain/money';
+import { FinanceTransactionContext } from '../transaction/finance-transaction-context';
 import { localDateToInstant, occurrencesWithin } from '../domain/recurrence';
 import { AccountRepository } from '../ledger/account.repository';
 import { LedgerService } from '../ledger/ledger.service';
@@ -81,14 +83,17 @@ export class IncomeService {
   private readonly repository: IncomeRepository;
   private readonly ledger: LedgerService;
   private readonly accounts: AccountRepository;
+  private readonly transactions: FinanceTransactionContext;
 
   constructor(
     @Inject(DATABASE) private readonly db: Kysely<Database>,
     private readonly clock: IncomeClock = () => new Date(),
+    @Optional() transactions?: FinanceTransactionContext,
   ) {
     this.repository = new IncomeRepository(db);
     this.ledger = new LedgerService(db);
     this.accounts = new AccountRepository(db);
+    this.transactions = transactions ?? new FinanceTransactionContext();
   }
 
   async createOneOff(input: OneOffIncomeInput): Promise<LedgerTransaction> {
@@ -96,7 +101,7 @@ export class IncomeService {
     validateDate(input.effectiveAt, 'effectiveAt');
     const name = input.name === undefined ? undefined : validateName(input.name);
 
-    return this.db.transaction().execute(async (trx) => {
+    return this.transactions.inTransaction(this.db, async (trx) => {
       const accounts = await this.accounts.findByKinds(
         input.userId,
         ['INCOME_SOURCE', 'FREE'],
@@ -151,7 +156,7 @@ export class IncomeService {
     validateCadence(input.cadence);
     const name = validateName(input.name);
 
-    return this.db.transaction().execute(async (trx) => {
+    return this.transactions.inTransaction(this.db, async (trx) => {
       await this.requireProfileLock(input.userId, trx);
       const row = await this.repository.createSchedule({
         userId: input.userId,
@@ -219,7 +224,7 @@ export class IncomeService {
     }
     const name = patch.name === undefined ? undefined : validateName(patch.name);
 
-    return this.db.transaction().execute(async (trx) => {
+    return this.transactions.inTransaction(this.db, async (trx) => {
       const profile = await this.requireProfileLock(userId, trx);
       const existing = await this.repository.lockActiveSchedule(userId, id, trx);
       if (!existing) {
@@ -247,7 +252,7 @@ export class IncomeService {
   }
 
   async archiveSchedule(userId: string, id: string): Promise<void> {
-    await this.db.transaction().execute(async (trx) => {
+    await this.transactions.inTransaction(this.db, async (trx) => {
       const profile = await this.requireProfileLock(userId, trx);
       const existing = await this.repository.lockActiveSchedule(userId, id, trx);
       if (!existing) {
@@ -284,7 +289,7 @@ export class IncomeService {
       await this.materializeInTransaction(userId, through, trx);
       return;
     }
-    await this.db.transaction().execute((transaction) =>
+    await this.transactions.inTransaction(this.db, (transaction) =>
       this.materializeInTransaction(userId, through, transaction));
   }
 

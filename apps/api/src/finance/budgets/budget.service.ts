@@ -5,6 +5,7 @@ import {
   Inject,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { DateTime } from 'luxon';
 import { sql, type Kysely, type Transaction } from 'kysely';
@@ -15,6 +16,7 @@ import type {
   ScheduleCadence,
 } from '../../database/database.types';
 import { assertMoneyMinor } from '../domain/money';
+import { FinanceTransactionContext } from '../transaction/finance-transaction-context';
 import { AccountRepository } from '../ledger/account.repository';
 import { LedgerService } from '../ledger/ledger.service';
 import {
@@ -74,10 +76,15 @@ type DatabaseExecutor = Kysely<Database> | Transaction<Database>;
 export class BudgetService {
   private readonly ledger: LedgerService;
   private readonly accounts: AccountRepository;
+  private readonly transactions: FinanceTransactionContext;
 
-  constructor(@Inject(DATABASE) private readonly db: Kysely<Database>) {
+  constructor(
+    @Inject(DATABASE) private readonly db: Kysely<Database>,
+    @Optional() transactions?: FinanceTransactionContext,
+  ) {
     this.ledger = new LedgerService(db);
     this.accounts = new AccountRepository(db);
+    this.transactions = transactions ?? new FinanceTransactionContext();
   }
 
   async create(input: CreateBudgetPlanInput): Promise<BudgetPlan> {
@@ -85,7 +92,7 @@ export class BudgetService {
     validateLocalDate(input.startsOn);
     validateCadence(input.cadence);
 
-    return this.db.transaction().execute(async (trx) => {
+    return this.transactions.inTransaction(this.db, async (trx) => {
       const profile = await trx.selectFrom('financial_profiles').select('user_id')
         .where('user_id', '=', input.userId).forUpdate().executeTakeFirst();
       if (!profile) throw new NotFoundException('Financial profile not found');
@@ -186,7 +193,7 @@ export class BudgetService {
       throw new BadRequestException('Budget plan patch contains an unsupported field');
     }
 
-    return this.db.transaction().execute(async (trx) => {
+    return this.transactions.inTransaction(this.db, async (trx) => {
       await lockActiveBudgetPlan(userId, id, trx);
       const row = await trx.updateTable('budget_plans').set({
         ...(patch.amountMinor === undefined
@@ -211,9 +218,9 @@ export class BudgetService {
     });
   }
 
-  async archive(userId: string, id: string): Promise<void> {
-    await this.db.transaction().execute(async (trx) => {
-      const now = new Date();
+  async archive(userId: string, id: string, now: Date = new Date()): Promise<void> {
+    validateDate(now, 'now');
+    await this.transactions.inTransaction(this.db, async (trx) => {
       const plan = await lockActiveBudgetPlan(userId, id, trx);
       await releaseAndArchiveBudgetPlans(userId, [plan], now, trx);
     });
@@ -230,7 +237,7 @@ export class BudgetService {
       await this.reconcileInTransaction(userId, periodId, now, trx);
       return;
     }
-    await this.db.transaction().execute((transaction) =>
+    await this.transactions.inTransaction(this.db, (transaction) =>
       this.reconcileInTransaction(userId, periodId, now, transaction));
   }
 
@@ -253,7 +260,7 @@ export class BudgetService {
       await work(trx);
       return;
     }
-    await this.db.transaction().execute(work);
+    await this.transactions.inTransaction(this.db, work);
   }
 
   async releasePeriodRemainders(
