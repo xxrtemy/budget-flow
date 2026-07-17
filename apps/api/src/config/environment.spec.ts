@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -46,16 +46,24 @@ describe.sequential('process environment loading', () => {
     }
   });
 
-  test('loads the workspace root environment before scheduler metadata is evaluated', async () => {
+  test('main loads the workspace environment before AppModule and scheduler evaluation', async () => {
     const fixture = await createWorkspaceFixture({
       rootEnv: 'DATABASE_URL=postgresql://root\nRECONCILIATION_CRON=*/11 * * * *\n',
     });
     process.chdir(fixture.packageDirectory);
     delete process.env.DATABASE_URL;
     delete process.env.RECONCILIATION_CRON;
+    const app = {
+      useGlobalPipes: vi.fn(),
+      listen: vi.fn(async () => undefined),
+    };
 
     try {
-      await import('./load-environment.js');
+      const { bootstrap } = await import('../main.js');
+      const { NestFactory } = await import('@nestjs/core');
+      vi.spyOn(NestFactory, 'create').mockResolvedValue(app as never);
+      await bootstrap();
+
       const { ReconciliationScheduler } = await import(
         '../finance/settlement/reconciliation.scheduler.js'
       );
@@ -64,27 +72,30 @@ describe.sequential('process environment loading', () => {
         ReconciliationScheduler.prototype.reconcileDueUsers,
       ) as { cronTime?: string } | undefined;
 
+      expect(app.listen).toHaveBeenCalledOnce();
       expect(process.env.DATABASE_URL).toBe('postgresql://root');
       expect(options?.cronTime).toBe('*/11 * * * *');
     } finally {
       process.chdir(ORIGINAL_CWD);
       await rm(fixture.workspaceDirectory, { recursive: true, force: true });
     }
+  }, 120_000);
+
+  test('migration entrypoint loads DATABASE_URL from the workspace environment', async () => {
+    const fixture = await createWorkspaceFixture({
+      rootEnv: 'DATABASE_URL=postgresql://migration-root\n',
+    });
+    process.chdir(fixture.packageDirectory);
+    delete process.env.DATABASE_URL;
+
+    try {
+      await import('../database/migrator.js');
+      expect(process.env.DATABASE_URL).toBe('postgresql://migration-root');
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      await rm(fixture.workspaceDirectory, { recursive: true, force: true });
+    }
   }, 60_000);
-
-  test('entrypoints load the environment before importing the app or reading DATABASE_URL', async () => {
-    const [mainSource, migratorSource] = await Promise.all([
-      readFile(join(ORIGINAL_CWD, 'src', 'main.ts'), 'utf8'),
-      readFile(join(ORIGINAL_CWD, 'src', 'database', 'migrator.ts'), 'utf8'),
-    ]);
-
-    expect(mainSource.indexOf("import './config/load-environment'")).toBeGreaterThanOrEqual(0);
-    expect(mainSource.indexOf("import './config/load-environment'"))
-      .toBeLessThan(mainSource.indexOf("import('./app.module.js')"));
-    expect(migratorSource.indexOf("import '../config/load-environment'")).toBeGreaterThanOrEqual(0);
-    expect(migratorSource.indexOf("import '../config/load-environment'"))
-      .toBeLessThan(migratorSource.indexOf('const url = process.env.DATABASE_URL'));
-  });
 
 });
 
