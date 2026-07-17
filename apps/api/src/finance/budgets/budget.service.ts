@@ -230,6 +230,28 @@ export class BudgetService {
       this.reconcileInTransaction(userId, periodId, now, transaction));
   }
 
+  async reconcileOpenPeriods(
+    userId: string,
+    now: Date,
+    trx?: Transaction<Database>,
+  ): Promise<void> {
+    validateDate(now, 'now');
+    const work = async (transaction: Transaction<Database>) => {
+      const profile = await transaction.selectFrom('financial_profiles')
+        .select('user_id').where('user_id', '=', userId).forUpdate().executeTakeFirst();
+      if (!profile) throw new NotFoundException('Financial profile not found');
+      const periods = await transaction.selectFrom('calculation_periods')
+        .selectAll().where('user_id', '=', userId).where('status', '=', 'OPEN')
+        .orderBy('id').forUpdate().execute();
+      await this.reconcileLockedPeriods(userId, periods, now, transaction);
+    };
+    if (trx) {
+      await work(trx);
+      return;
+    }
+    await this.db.transaction().execute(work);
+  }
+
   private async reconcileInTransaction(
     userId: string,
     periodId: string,
@@ -246,6 +268,21 @@ export class BudgetService {
     if (!period) {
       throw new NotFoundException('Calculation period not found');
     }
+    await this.reconcileLockedPeriods(userId, [period], now, trx);
+  }
+
+  private async reconcileLockedPeriods(
+    userId: string,
+    periods: ReadonlyArray<{
+      id: string;
+      starts_at: Date;
+      ends_at_exclusive: Date;
+      timezone: string;
+    }>,
+    now: Date,
+    trx: Transaction<Database>,
+  ): Promise<void> {
+    if (periods.length === 0) return;
     const plans = await lockAllActiveBudgetPlans(userId, trx);
     if (plans.length === 0) {
       return;
@@ -280,56 +317,58 @@ export class BudgetService {
       trx,
     );
 
-    const range = {
-      startsOn: localDate(period.starts_at, period.timezone),
-      endsOnExclusive: localDate(period.ends_at_exclusive, period.timezone),
-    };
-    for (const plan of plans) {
-      const effectiveAt = plan.updated_at > period.starts_at
-        ? plan.updated_at
-        : period.starts_at;
-      const notBefore = localDate(effectiveAt, period.timezone);
-      const { occurrenceDates } = calculateBudgetOccurrences({
-        amountMinor: parseMoney(plan.amount_minor),
-        startsOn: plan.starts_on,
-        cadence: plan.cadence,
-      }, range, notBefore);
-      if (occurrenceDates.length === 0) {
-        continue;
-      }
-      const existing = await trx.selectFrom('budget_allocations')
-        .select('occurrence_on')
-        .where('user_id', '=', userId)
-        .where('budget_plan_id', '=', plan.id)
-        .where('period_id', '=', periodId)
-        .where('occurrence_on', 'in', occurrenceDates)
-        .execute();
-      const existingDates = new Set(existing.map(({ occurrence_on }) => occurrence_on));
-      for (const occurrenceOn of occurrenceDates) {
-        if (existingDates.has(occurrenceOn)) {
+    for (const period of periods) {
+      const range = {
+        startsOn: localDate(period.starts_at, period.timezone),
+        endsOnExclusive: localDate(period.ends_at_exclusive, period.timezone),
+      };
+      for (const plan of plans) {
+        const effectiveAt = plan.updated_at > period.starts_at
+          ? plan.updated_at
+          : period.starts_at;
+        const notBefore = localDate(effectiveAt, period.timezone);
+        const { occurrenceDates } = calculateBudgetOccurrences({
+          amountMinor: parseMoney(plan.amount_minor),
+          startsOn: plan.starts_on,
+          cadence: plan.cadence,
+        }, range, notBefore);
+        if (occurrenceDates.length === 0) {
           continue;
         }
-        const amountMinor = parseMoney(plan.amount_minor);
-        const reservation = await this.ledger.post({
-          userId,
-          type: 'BUDGET_RESERVATION',
-          effectiveAt: now,
-          metadata: { budgetPlanId: plan.id, periodId, occurrenceOn },
-          postings: [
-            { accountId: freeAccount.id, amountMinor: -amountMinor },
-            { accountId: reserveByPlan.get(plan.id)!, amountMinor },
-          ],
-        }, trx);
-        await trx.insertInto('budget_allocations').values({
-          id: randomUUID(),
-          user_id: userId,
-          budget_plan_id: plan.id,
-          period_id: periodId,
-          occurrence_on: occurrenceOn,
-          amount_minor: amountMinor,
-          reservation_transaction_id: reservation.id,
-          released_transaction_id: null,
-        }).execute();
+        const existing = await trx.selectFrom('budget_allocations')
+          .select('occurrence_on')
+          .where('user_id', '=', userId)
+          .where('budget_plan_id', '=', plan.id)
+          .where('period_id', '=', period.id)
+          .where('occurrence_on', 'in', occurrenceDates)
+          .execute();
+        const existingDates = new Set(existing.map(({ occurrence_on }) => occurrence_on));
+        for (const occurrenceOn of occurrenceDates) {
+          if (existingDates.has(occurrenceOn)) {
+            continue;
+          }
+          const amountMinor = parseMoney(plan.amount_minor);
+          const reservation = await this.ledger.post({
+            userId,
+            type: 'BUDGET_RESERVATION',
+            effectiveAt: now,
+            metadata: { budgetPlanId: plan.id, periodId: period.id, occurrenceOn },
+            postings: [
+              { accountId: freeAccount.id, amountMinor: -amountMinor },
+              { accountId: reserveByPlan.get(plan.id)!, amountMinor },
+            ],
+          }, trx);
+          await trx.insertInto('budget_allocations').values({
+            id: randomUUID(),
+            user_id: userId,
+            budget_plan_id: plan.id,
+            period_id: period.id,
+            occurrence_on: occurrenceOn,
+            amount_minor: amountMinor,
+            reservation_transaction_id: reservation.id,
+            released_transaction_id: null,
+          }).execute();
+        }
       }
     }
   }
