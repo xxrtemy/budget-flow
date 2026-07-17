@@ -472,6 +472,8 @@ expect(calculateBudgetOccurrences(
 
 Add a mid-period plan test that includes only not-yet-started intervals and a quarterly plan spanning an annual period.
 
+Add lifecycle tests: archiving a plan with a positive reserve posts `BUDGET_RESERVE → FREE` as `BUDGET_RELEASE` before archiving it; archiving a category releases and archives every active plan in that category in one transaction. Historical allocations and expense metadata retain the original category ID.
+
 - [ ] **Step 2: Run and verify RED**
 
 Run: `pnpm --filter @budget-flow/api test:unit -- budget-calculator.spec.ts`
@@ -542,6 +544,8 @@ export class ExpenseService {
 ```
 
 Each budget plan owns one `BUDGET_RESERVE` account. `reconcilePeriod` creates unique allocation rows and posts `FREE → BUDGET_RESERVE`. Expense creation locks the category reserve and free account, consumes reserve first, posts any remainder from free to `EXPENSE_SINK`, and returns the remaining category reserve.
+
+`BudgetPlanPatch` contains only `amountMinor`, `startsOn`, and `cadence`; category ownership is immutable. `BudgetService.archive` locks the plan and reserve account, posts any positive balance back to `FREE` as `BUDGET_RELEASE`, then archives plan/account atomically. `CategoryService.archive` locks the category and all active plans/accounts, releases every positive reserve, archives those plans/accounts, then archives the category in the same transaction.
 
 - [ ] **Step 7: Verify GREEN**
 
