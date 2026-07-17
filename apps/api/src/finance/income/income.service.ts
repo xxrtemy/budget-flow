@@ -218,8 +218,6 @@ export class IncomeService {
       validateCadence(patch.cadence);
     }
     const name = patch.name === undefined ? undefined : validateName(patch.name);
-    const commandTime = this.clock();
-    validateDate(commandTime, 'clock');
 
     return this.db.transaction().execute(async (trx) => {
       const profile = await this.requireProfileLock(userId, trx);
@@ -227,11 +225,14 @@ export class IncomeService {
       if (!existing) {
         throw new NotFoundException('Income schedule not found');
       }
+      const commandTime = this.clock();
+      validateDate(commandTime, 'clock');
+      const boundary = normalizeUpdateBoundary(existing, commandTime);
       await this.applySchedulesDue(
         userId,
         profile.timezone,
         [existing],
-        commandTime,
+        boundary,
         trx,
       );
       const row = await this.repository.updateSchedule(userId, id, {
@@ -239,21 +240,21 @@ export class IncomeService {
         startsOn: patch.startsOn,
         cadence: patch.cadence,
         name,
-        updatedAt: commandTime,
+        updatedAt: boundary,
       }, trx);
       return toIncomeSchedule(row);
     });
   }
 
   async archiveSchedule(userId: string, id: string): Promise<void> {
-    const commandTime = this.clock();
-    validateDate(commandTime, 'clock');
     await this.db.transaction().execute(async (trx) => {
       const profile = await this.requireProfileLock(userId, trx);
       const existing = await this.repository.lockActiveSchedule(userId, id, trx);
       if (!existing) {
         throw new NotFoundException('Income schedule not found');
       }
+      const commandTime = this.clock();
+      validateDate(commandTime, 'clock');
       await this.applySchedulesDue(
         userId,
         profile.timezone,
@@ -324,6 +325,11 @@ export class IncomeService {
 
     const endsOnExclusive = throughLocal.plus({ days: 1 }).toISODate()!;
     for (const schedule of schedules) {
+      const appliedOccurrenceOns = await this.repository.loadAppliedLocalOccurrenceOns(
+        userId,
+        schedule.id,
+        trx,
+      );
       const occurrenceDates = occurrencesWithin({
         startsOn: schedule.starts_on,
         cadence: schedule.cadence,
@@ -340,12 +346,7 @@ export class IncomeService {
         if (wasUpdated(schedule) && dueAt.getTime() <= schedule.updated_at.getTime()) {
           continue;
         }
-        if (await this.repository.hasAppliedLocalOccurrence(
-          userId,
-          schedule.id,
-          occurrenceOn,
-          trx,
-        )) {
+        if (appliedOccurrenceOns.has(occurrenceOn)) {
           continue;
         }
 
@@ -390,6 +391,7 @@ export class IncomeService {
           .where('id', '=', occurrence.id)
           .where('status', '=', 'PENDING')
           .executeTakeFirstOrThrow();
+        appliedOccurrenceOns.add(occurrenceOn);
       }
     }
   }
@@ -463,6 +465,19 @@ function toIncomeSchedule(row: IncomeScheduleRow): IncomeSchedule {
 
 function wasUpdated(row: IncomeScheduleRow): boolean {
   return row.updated_at.getTime() !== row.created_at.getTime();
+}
+
+function normalizeUpdateBoundary(
+  row: IncomeScheduleRow,
+  commandTime: Date,
+): Date {
+  const commandMilliseconds = commandTime.getTime();
+  if (!wasUpdated(row)) {
+    return new Date(commandMilliseconds === row.created_at.getTime()
+      ? commandMilliseconds + 1
+      : commandMilliseconds);
+  }
+  return new Date(Math.max(commandMilliseconds, row.updated_at.getTime() + 1));
 }
 
 function validateAmount(value: number): void {

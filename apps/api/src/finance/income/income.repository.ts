@@ -204,20 +204,43 @@ export class IncomeRepository {
       .execute();
   }
 
-  async hasAppliedLocalOccurrence(
+  async loadAppliedLocalOccurrenceOns(
     userId: string,
     scheduleId: string,
-    occurrenceOn: string,
     executor: DatabaseExecutor,
-  ): Promise<boolean> {
-    const row = await executor.selectFrom('ledger_transactions')
-      .select('id')
-      .where('user_id', '=', userId)
-      .where('type', '=', 'INCOME')
-      .where('source_occurrence_id', 'is not', null)
-      .where(sql<boolean>`metadata ->> 'incomeScheduleId' = ${scheduleId}`)
-      .where(sql<boolean>`metadata ->> 'occurrenceOn' = ${occurrenceOn}`)
-      .executeTakeFirst();
-    return Boolean(row);
+  ): Promise<Set<string>> {
+    const rows = await executor.selectFrom('schedule_occurrences')
+      .innerJoin('ledger_transactions', (join) => join
+        .onRef(
+          'ledger_transactions.id',
+          '=',
+          'schedule_occurrences.applied_transaction_id',
+        )
+        .onRef(
+          'ledger_transactions.user_id',
+          '=',
+          'schedule_occurrences.user_id',
+        ))
+      .select('ledger_transactions.metadata')
+      .where('schedule_occurrences.user_id', '=', userId)
+      .where('ledger_transactions.user_id', '=', userId)
+      .where('schedule_occurrences.schedule_type', '=', 'INCOME')
+      .where('schedule_occurrences.schedule_id', '=', scheduleId)
+      .where('schedule_occurrences.status', '=', 'APPLIED')
+      .where('ledger_transactions.type', '=', 'INCOME')
+      .whereRef(
+        'ledger_transactions.source_occurrence_id',
+        '=',
+        'schedule_occurrences.id',
+      )
+      .execute();
+
+    return new Set(rows.map(({ metadata }) => {
+      const occurrenceOn = (metadata as Record<string, unknown>).occurrenceOn;
+      if (typeof occurrenceOn !== 'string') {
+        throw new Error('Applied income metadata is missing occurrenceOn');
+      }
+      return occurrenceOn;
+    }));
   }
 }

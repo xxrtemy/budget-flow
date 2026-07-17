@@ -13,6 +13,7 @@ import type { Database } from '../../database/database.types';
 import { migrateToLatest } from '../../database/migrator';
 import { ProfileRepository } from '../profile/profile.repository';
 import { ProfileService } from '../profile/profile.service';
+import { LedgerService } from '../ledger/ledger.service';
 import { IncomeService } from './income.service';
 
 const NOW = new Date('2026-01-01T09:00:00.000Z');
@@ -244,6 +245,109 @@ describe('IncomeService', () => {
     ]);
   });
 
+  test('keeps the update cutoff when the command clock exactly equals schedule createdAt', async () => {
+    const userId = await createProfile();
+    const initialService = incomeService();
+    const schedule = await initialService.createSchedule({
+      userId,
+      amountMinor: 100_000,
+      startsOn: '2026-01-31',
+      cadence: 'MONTHLY',
+      name: 'Salary',
+    });
+    const service = incomeService(() => schedule.createdAt);
+
+    const updated = await service.updateSchedule(userId, schedule.id, {
+      startsOn: '2026-01-30',
+    });
+    await service.materializeAndApplyDue(userId, new Date('2026-08-30T21:00:00.000Z'));
+
+    expect(updated.updatedAt.getTime()).toBe(schedule.createdAt.getTime() + 1);
+    const occurrenceOns = await recurringIncomeOccurrenceOns(userId);
+    expect(occurrenceOns).not.toContain('2026-01-30');
+    expect(occurrenceOns).not.toContain('2026-03-30');
+    expect(occurrenceOns).toContain('2026-07-30');
+  });
+
+  test('keeps update boundaries monotonic across sequential stale command clocks', async () => {
+    const userId = await createProfile();
+    const firstBoundary = new Date('2026-04-01T00:00:00.000Z');
+    const staleBoundary = new Date('2026-03-01T00:00:00.000Z');
+    const schedule = await incomeService(() => firstBoundary).createSchedule({
+      userId,
+      amountMinor: 100_000,
+      startsOn: '2026-01-31',
+      cadence: 'MONTHLY',
+      name: 'Salary',
+    });
+    await incomeService().materializeAndApplyDue(
+      userId,
+      new Date('2026-03-30T21:00:00.000Z'),
+    );
+
+    const first = await incomeService(() => firstBoundary).updateSchedule(
+      userId,
+      schedule.id,
+      { startsOn: '2026-01-30' },
+    );
+    const second = await incomeService(() => staleBoundary).updateSchedule(
+      userId,
+      schedule.id,
+      { startsOn: '2026-01-29' },
+    );
+    await incomeService().materializeAndApplyDue(
+      userId,
+      new Date('2026-04-28T21:00:00.000Z'),
+    );
+
+    expect(first.updatedAt).toEqual(firstBoundary);
+    expect(second.updatedAt.getTime()).toBe(first.updatedAt.getTime() + 1);
+    await expect(recurringIncomeOccurrenceOns(userId)).resolves.toEqual([
+      '2026-01-31',
+      '2026-02-28',
+      '2026-03-31',
+      '2026-04-29',
+    ]);
+  });
+
+  test('reads a waiting update clock only after acquiring profile and schedule locks', async () => {
+    const userId = await createProfile();
+    const schedule = await incomeService().createSchedule({
+      userId,
+      amountMinor: 100_000,
+      startsOn: '2026-01-31',
+      cadence: 'MONTHLY',
+      name: 'Salary',
+    });
+    let releaseLock!: () => void;
+    let reportLocked!: () => void;
+    const releasePromise = new Promise<void>((resolve) => { releaseLock = resolve; });
+    const lockedPromise = new Promise<void>((resolve) => { reportLocked = resolve; });
+    const blocker = database().transaction().execute(async (trx) => {
+      await trx.selectFrom('financial_profiles')
+        .select('user_id')
+        .where('user_id', '=', userId)
+        .forUpdate()
+        .executeTakeFirstOrThrow();
+      reportLocked();
+      await releasePromise;
+    });
+    await lockedPromise;
+    let clockCalls = 0;
+    const update = incomeService(() => {
+      clockCalls += 1;
+      return new Date('2026-02-01T00:00:00.000Z');
+    }).updateSchedule(userId, schedule.id, { name: 'Waiting salary' });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const callsWhileBlocked = clockCalls;
+    releaseLock();
+    await blocker;
+    await update;
+    expect(callsWhileBlocked).toBe(0);
+    expect(clockCalls).toBe(1);
+  });
+
   test('deduplicates a local occurrence date after the profile timezone changes', async () => {
     const userId = await createProfile('Europe/Moscow');
     const service = incomeService();
@@ -271,6 +375,43 @@ describe('IncomeService', () => {
       .where('schedule_type', '=', 'INCOME')
       .execute();
     expect(occurrences).toEqual([{ due_at: new Date('2026-01-30T21:00:00.000Z') }]);
+  });
+
+  test('does not let forged metadata from another schedule suppress a legitimate income', async () => {
+    const userId = await createProfile();
+    const service = incomeService();
+    const target = await service.createSchedule({
+      userId,
+      amountMinor: 100_000,
+      startsOn: '2026-01-31',
+      cadence: 'MONTHLY',
+      name: 'Target salary',
+    });
+    const other = await service.createSchedule({
+      userId,
+      amountMinor: 1,
+      startsOn: '2027-01-01',
+      cadence: 'ANNUAL',
+      name: 'Other salary',
+    });
+    await forgeAppliedIncomeOccurrence({
+      userId,
+      scheduleId: other.id,
+      metadataScheduleId: target.id,
+      occurrenceOn: '2026-01-31',
+    });
+
+    await service.materializeAndApplyDue(userId, new Date('2026-01-30T21:00:00.000Z'));
+
+    const targetOccurrences = await database().selectFrom('schedule_occurrences')
+      .select('id')
+      .where('user_id', '=', userId)
+      .where('schedule_type', '=', 'INCOME')
+      .where('schedule_id', '=', target.id)
+      .where('status', '=', 'APPLIED')
+      .execute();
+    expect(targetOccurrences).toHaveLength(1);
+    await expect(recurringIncomeTransactions(userId)).resolves.toHaveLength(2);
   });
 
   test('applies an already-due missed income before archiving its schedule', async () => {
@@ -525,6 +666,54 @@ async function recurringIncomeOccurrenceOns(userId: string): Promise<string[]> {
     }
     return occurrenceOn;
   });
+}
+
+async function forgeAppliedIncomeOccurrence(input: {
+  userId: string;
+  scheduleId: string;
+  metadataScheduleId: string;
+  occurrenceOn: string;
+}): Promise<void> {
+  const occurrenceId = randomUUID();
+  await database().insertInto('schedule_occurrences').values({
+    id: occurrenceId,
+    user_id: input.userId,
+    schedule_type: 'INCOME',
+    schedule_id: input.scheduleId,
+    due_at: new Date('2026-01-29T21:00:00.000Z'),
+    status: 'PENDING',
+    reservation_transaction_id: null,
+    applied_transaction_id: null,
+    cancelled_at: null,
+  }).execute();
+  const accounts = await database().selectFrom('financial_accounts')
+    .select(['id', 'kind'])
+    .where('user_id', '=', input.userId)
+    .where('kind', 'in', ['INCOME_SOURCE', 'FREE'])
+    .execute();
+  const sourceId = accounts.find(({ kind }) => kind === 'INCOME_SOURCE')!.id;
+  const freeId = accounts.find(({ kind }) => kind === 'FREE')!.id;
+  const transaction = await new LedgerService(database()).post({
+    userId: input.userId,
+    type: 'INCOME',
+    effectiveAt: new Date('2026-01-29T21:00:00.000Z'),
+    sourceOccurrenceId: occurrenceId,
+    metadata: {
+      incomeScheduleId: input.metadataScheduleId,
+      occurrenceOn: input.occurrenceOn,
+      name: 'Forged metadata',
+    },
+    postings: [
+      { accountId: sourceId, amountMinor: -1 },
+      { accountId: freeId, amountMinor: 1 },
+    ],
+  });
+  await database().updateTable('schedule_occurrences').set({
+    status: 'APPLIED',
+    applied_transaction_id: transaction.id,
+  }).where('user_id', '=', input.userId)
+    .where('id', '=', occurrenceId)
+    .executeTakeFirstOrThrow();
 }
 
 async function installRecurringIncomeFailureTrigger(): Promise<void> {
