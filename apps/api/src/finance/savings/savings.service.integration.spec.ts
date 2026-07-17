@@ -119,6 +119,40 @@ describe('SavingsService', () => {
     expect(await savingsTransactionCount(userId)).toBe(0);
   });
 
+  test('transfers from general savings back to free without changing actual balance', async () => {
+    const userId = await createUser(10_000);
+    const service = savingsService();
+    const goal = await service.createGoal(userId, { name: 'Balance probe' });
+    const initialActual = await actualBalance(userId);
+    await service.transfer(transfer(
+      userId, { type: 'FREE' }, { type: 'GENERAL' }, 6_000,
+    ));
+
+    await service.transfer(transfer(
+      userId, { type: 'GENERAL' }, { type: 'FREE' }, 2_000,
+    ));
+
+    expect(await balances(userId, goal.id)).toEqual({
+      free: 6_000, general: 4_000, goal: 0,
+    });
+    expect(await actualBalance(userId)).toBe(initialActual);
+  });
+
+  test.each(['getGoal', 'updateGoal', 'archiveGoal'] as const)(
+    'rejects a non-UUID goal id at the %s boundary with domain 400',
+    async (operation) => {
+      const userId = await createUser();
+      const service = savingsService();
+      const promise = operation === 'getGoal'
+        ? service.getGoal(userId, 'invalid')
+        : operation === 'updateGoal'
+          ? service.updateGoal(userId, 'invalid', { name: 'Updated' })
+          : service.archiveGoal(userId, 'invalid');
+
+      await expect(promise).rejects.toBeInstanceOf(BadRequestException);
+    },
+  );
+
   test('hides foreign, missing and archived goals from every operation', async () => {
     const ownerId = await createUser(10_000);
     const otherId = await createUser(10_000);
@@ -201,6 +235,24 @@ describe('SavingsService', () => {
     expect(second.nextCursor).toBeNull();
     expect(new Set([...first.items, ...second.items].map(({ id }) => id)).size).toBe(51);
     await expect(service.listGoals(userId, 'not-a-cursor'))
+      .rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  test.each([
+    '',
+    null,
+    false,
+    0,
+    'not-a-cursor',
+    Buffer.from(JSON.stringify({
+      id: randomUUID(),
+      createdAtMicros: '1',
+    })).toString('base64url'),
+  ])('rejects an explicitly supplied invalid runtime cursor %#', async (cursor) => {
+    const userId = await createUser();
+    await savingsService().createGoal(userId, { name: 'Cursor target' });
+
+    await expect(savingsService().listGoals(userId, cursor as string))
       .rejects.toBeInstanceOf(BadRequestException);
   });
 

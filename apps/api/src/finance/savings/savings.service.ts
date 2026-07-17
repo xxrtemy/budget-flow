@@ -76,6 +76,7 @@ export class SavingsService {
   }
 
   async getGoal(userId: string, id: string): Promise<SavingsGoal> {
+    validateGoalId(id);
     const row = await this.findActiveGoal(userId, id, this.db);
     if (!row) {
       throw new NotFoundException('Savings goal not found');
@@ -87,7 +88,13 @@ export class SavingsService {
     items: SavingsGoal[];
     nextCursor: string | null;
   }> {
-    const decoded = cursor ? decodeListCursor(cursor) : undefined;
+    let decoded;
+    if (cursor !== undefined) {
+      if (typeof cursor !== 'string') {
+        throw new BadRequestException('Invalid cursor');
+      }
+      decoded = decodeListCursor(cursor);
+    }
     let query = this.db.selectFrom('financial_accounts')
       .selectAll()
       .select(
@@ -129,6 +136,7 @@ export class SavingsService {
     id: string,
     patch: UpdateSavingsGoalInput,
   ): Promise<SavingsGoal> {
+    validateGoalId(id);
     assertExactKeys(patch, ['name', 'targetMinor'], 'goal patch');
     if (!Object.hasOwn(patch, 'name') && !Object.hasOwn(patch, 'targetMinor')) {
       throw new BadRequestException('Goal patch must contain a supported field');
@@ -154,6 +162,7 @@ export class SavingsService {
   }
 
   async archiveGoal(userId: string, id: string): Promise<void> {
+    validateGoalId(id);
     await this.db.transaction().execute(async (trx) => {
       const [account] = await this.accounts.lockPostingAccounts(userId, [id], trx);
       assertActiveGoal(account);
@@ -318,6 +327,12 @@ function validateName(value: unknown): string {
     throw new BadRequestException('name must be a non-empty string');
   }
   return value.trim();
+}
+
+function validateGoalId(value: unknown): asserts value is string {
+  if (typeof value !== 'string' || !UUID_PATTERN.test(value)) {
+    throw new BadRequestException('goalId must be a valid UUID');
+  }
 }
 
 function validateTarget(value: unknown): number {
