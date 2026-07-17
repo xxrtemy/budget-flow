@@ -3,7 +3,15 @@ import { randomUUID } from 'node:crypto';
 import { HttpStatus } from '@nestjs/common';
 import { PostgreSqlContainer } from '@testcontainers/postgresql';
 import { sql, type Kysely } from 'kysely';
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest';
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  expectTypeOf,
+  test,
+} from 'vitest';
 
 import { createDatabase } from '../../database/database.factory';
 import type { AccountKind, Database } from '../../database/database.types';
@@ -12,6 +20,11 @@ import { ProfileRepository } from '../profile/profile.repository';
 import { ProfileService } from '../profile/profile.service';
 import { AccountRepository } from './account.repository';
 import { LedgerService } from './ledger.service';
+import type {
+  LedgerTransactionType,
+  PostLedgerInput,
+  PostLedgerTransactionType,
+} from './ledger.types';
 
 const NOW = new Date('2026-07-17T08:00:00.000Z');
 
@@ -28,6 +41,13 @@ beforeEach(async () => { await context?.reset(); });
 afterAll(async () => { await context?.close(); });
 
 describe('LedgerService', () => {
+  test('excludes REVERSAL from the public post input type', () => {
+    expectTypeOf<PostLedgerInput['type']>()
+      .toEqualTypeOf<PostLedgerTransactionType>();
+    expectTypeOf<PostLedgerTransactionType>()
+      .toEqualTypeOf<Exclude<LedgerTransactionType, 'REVERSAL'>>();
+  });
+
   test('posts a balanced entry atomically and returns the resulting balance', async () => {
     const userId = await createUser();
     const openingEquityId = await accountId(userId, 'OPENING_EQUITY');
@@ -135,6 +155,66 @@ describe('LedgerService', () => {
       .resolves.toBe(25_000);
   });
 
+  test('rejects every non-canonical opening balance shape before insert', async () => {
+    const userId = await createUser();
+    const openingEquityId = await accountId(userId, 'OPENING_EQUITY');
+    const freeId = await accountId(userId, 'FREE');
+    const incomeId = await accountId(userId, 'INCOME_SOURCE');
+    const savingsId = await accountId(userId, 'SAVINGS_GENERAL');
+    const invalidPostings = [
+      [
+        { accountId: incomeId, amountMinor: -1_000 },
+        { accountId: freeId, amountMinor: 1_000 },
+      ],
+      [
+        { accountId: openingEquityId, amountMinor: 1_000 },
+        { accountId: freeId, amountMinor: -1_000 },
+      ],
+      [
+        { accountId: openingEquityId, amountMinor: -1_000 },
+        { accountId: savingsId, amountMinor: 1_000 },
+      ],
+      [
+        { accountId: savingsId, amountMinor: -1_000 },
+        { accountId: freeId, amountMinor: 1_000 },
+      ],
+      [
+        { accountId: openingEquityId, amountMinor: -1_000 },
+        { accountId: freeId, amountMinor: 500 },
+        { accountId: savingsId, amountMinor: 500 },
+      ],
+    ] as const;
+
+    for (const postings of invalidPostings) {
+      await expect(ledgerService().post({
+        userId,
+        type: 'OPENING_BALANCE',
+        effectiveAt: NOW,
+        postings,
+      })).rejects.toMatchObject({ status: HttpStatus.BAD_REQUEST });
+    }
+    await expect(transactionCount(userId)).resolves.toBe(0);
+  });
+
+  test('rejects REVERSAL passed to post at runtime before insert', async () => {
+    const userId = await createUser();
+    const freeId = await accountId(userId, 'FREE');
+    const incomeId = await accountId(userId, 'INCOME_SOURCE');
+    const input = {
+      userId,
+      type: 'REVERSAL',
+      effectiveAt: NOW,
+      postings: [
+        { accountId: incomeId, amountMinor: -1_000 },
+        { accountId: freeId, amountMinor: 1_000 },
+      ],
+    } as unknown as PostLedgerInput;
+
+    await expect(ledgerService().post(input))
+      .rejects.toMatchObject({ status: HttpStatus.BAD_REQUEST });
+    await expect(transactionCount(userId)).resolves.toBe(0);
+  });
+
   test('allows ordinary expense postings to make FREE negative', async () => {
     const userId = await createUser();
     const freeId = await accountId(userId, 'FREE');
@@ -156,10 +236,8 @@ describe('LedgerService', () => {
 
   test('locks scoped accounts in stable UUID order and reads balances in the transaction', async () => {
     const userId = await createUser();
-    const otherUserId = await createUser();
     const freeId = await accountId(userId, 'FREE');
     const incomeId = await accountId(userId, 'INCOME_SOURCE');
-    const foreignFreeId = await accountId(otherUserId, 'FREE');
     await ledgerService().post({
       userId,
       type: 'INCOME',
@@ -173,7 +251,7 @@ describe('LedgerService', () => {
     const locked = await database().transaction().execute((trx) =>
       new AccountRepository(database()).lockAccounts(
         userId,
-        [freeId, foreignFreeId, incomeId, freeId],
+        [freeId, incomeId, freeId],
         trx,
       ));
 
@@ -182,6 +260,24 @@ describe('LedgerService', () => {
       { id: incomeId, userId, balanceMinor: -2_500 },
     ].sort((left, right) => left.id.localeCompare(right.id)));
   });
+
+  test.each(['missing', 'foreign'] as const)(
+    'lockAccounts hides a %s account as 404 instead of returning a partial set',
+    async (accountSource) => {
+      const userId = await createUser();
+      const freeId = await accountId(userId, 'FREE');
+      const inaccessibleId = accountSource === 'missing'
+        ? randomUUID()
+        : await accountId(await createUser(), 'FREE');
+
+      await expect(database().transaction().execute((trx) =>
+        new AccountRepository(database()).lockAccounts(
+          userId,
+          [freeId, inaccessibleId],
+          trx,
+        ))).rejects.toMatchObject({ status: HttpStatus.NOT_FOUND });
+    },
+  );
 
   test('reverses by appending exact mirrored postings and rejects a second reversal', async () => {
     const userId = await createUser();
@@ -219,6 +315,35 @@ describe('LedgerService', () => {
     await expect(transactionCount(userId)).resolves.toBe(2);
   });
 
+  test('serializes concurrent double reversal to one success and one 409', async () => {
+    const userId = await createUser();
+    const freeId = await accountId(userId, 'FREE');
+    const incomeId = await accountId(userId, 'INCOME_SOURCE');
+    const ledger = ledgerService();
+    const original = await ledger.post({
+      userId,
+      type: 'INCOME',
+      effectiveAt: NOW,
+      postings: [
+        { accountId: incomeId, amountMinor: -3_000 },
+        { accountId: freeId, amountMinor: 3_000 },
+      ],
+    });
+
+    const results = await Promise.allSettled([
+      ledger.reverse(userId, original.id, NOW),
+      ledger.reverse(userId, original.id, NOW),
+    ]);
+
+    expect(results.filter(({ status }) => status === 'fulfilled')).toHaveLength(1);
+    expect(results.find(({ status }) => status === 'rejected')).toMatchObject({
+      status: 'rejected',
+      reason: { status: HttpStatus.CONFLICT },
+    });
+    await expect(transactionCount(userId, 'REVERSAL')).resolves.toBe(1);
+    await expect(transactionCount(userId)).resolves.toBe(2);
+  });
+
   test('returns only the user ledger with deterministic cursor pagination', async () => {
     const userId = await createUser();
     const otherUserId = await createUser();
@@ -238,6 +363,29 @@ describe('LedgerService', () => {
     expect([...firstPage.items, ...secondPage.items].every((item) => item.userId === userId))
       .toBe(true);
     expect(firstPage.items.every((item) => item.postings.length === 2)).toBe(true);
+  });
+
+  test.each([
+    'not-base64url%',
+    Buffer.from(JSON.stringify({
+      createdAt: '2026-07-17T08:00:00Z',
+      id: randomUUID(),
+    })).toString('base64url'),
+    `${Buffer.from(JSON.stringify({
+      createdAt: '2026-07-17 08:00:00+00',
+      id: randomUUID(),
+    })).toString('base64url')}=`,
+    Buffer.from(JSON.stringify({
+      createdAtMicros: '01784300000000000',
+      id: randomUUID(),
+    })).toString('base64url'),
+    Buffer.from(JSON.stringify({
+      createdAtMicros: '999999999999999999999999999999999999',
+      id: randomUUID(),
+    })).toString('base64url'),
+  ])('rejects a non-canonical or unsafe cursor with domain 400', async (cursor) => {
+    await expect(ledgerService().list(randomUUID(), cursor))
+      .rejects.toMatchObject({ status: HttpStatus.BAD_REQUEST });
   });
 
   test('relies on the deferred database trigger for direct unbalanced inserts', async () => {

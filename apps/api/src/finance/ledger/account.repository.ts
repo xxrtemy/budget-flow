@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, NotFoundException } from '@nestjs/common';
 import { sql, type Kysely, type Transaction } from 'kysely';
 
 import { DATABASE } from '../../database/database.constants';
@@ -33,24 +33,23 @@ export class AccountRepository {
       .execute();
   }
 
-  async findOwnedIds(
+  async findByIds(
     userId: string,
     accountIds: readonly string[],
     executor: DatabaseExecutor = this.db,
-  ): Promise<string[]> {
+  ): Promise<AccountIdentity[]> {
     const uniqueIds = uniqueSortedIds(accountIds);
     if (uniqueIds.length === 0) {
       return [];
     }
 
-    const rows = await executor
+    return executor
       .selectFrom('financial_accounts')
-      .select('id')
+      .select(['id', 'kind'])
       .where('user_id', '=', userId)
       .where('id', 'in', uniqueIds)
       .orderBy('id')
       .execute();
-    return rows.map(({ id }) => id);
   }
 
   async getBalance(
@@ -95,6 +94,9 @@ export class AccountRepository {
       .orderBy('id')
       .forUpdate()
       .execute();
+    if (accounts.length !== uniqueIds.length) {
+      throw new NotFoundException('Financial account not found');
+    }
 
     const balances = await trx
       .selectFrom('ledger_postings')

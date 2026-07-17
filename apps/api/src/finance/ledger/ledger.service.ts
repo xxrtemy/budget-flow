@@ -19,7 +19,7 @@ import type {
 import { assertMoneyMinor } from '../domain/money';
 import { AccountRepository } from './account.repository';
 import {
-  LEDGER_TRANSACTION_TYPES,
+  POST_LEDGER_TRANSACTION_TYPES,
   type LedgerPosting,
   type LedgerTransaction,
   type LedgerTransactionType,
@@ -27,14 +27,21 @@ import {
 } from './ledger.types';
 
 const PAGE_SIZE = 50;
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
+const CURSOR_MICROS_PATTERN = /^[1-9][0-9]{0,15}$/;
+const MAX_CURSOR_MICROS = BigInt(Number.MAX_SAFE_INTEGER);
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 type TransactionRow = Selectable<LedgerTransactionsTable>;
 type PostingRow = Selectable<LedgerPostingsTable>;
 
 interface LedgerCursor {
-  createdAt: string;
+  createdAtMicros: string;
   id: string;
+}
+
+interface InternalPostLedgerInput extends Omit<PostLedgerInput, 'type'> {
+  type: LedgerTransactionType;
 }
 
 @Injectable()
@@ -119,7 +126,7 @@ export class LedgerService {
       }
 
       const target = await this.loadTransaction(targetRow, trx);
-      return this.insert({
+      const reversalInput: InternalPostLedgerInput = {
         userId,
         type: 'REVERSAL',
         effectiveAt: now,
@@ -128,7 +135,8 @@ export class LedgerService {
           accountId,
           amountMinor: -amountMinor,
         })),
-      }, target.id, trx);
+      };
+      return this.insert(reversalInput, target.id, trx);
     });
   }
 
@@ -152,11 +160,21 @@ export class LedgerService {
     let query = this.db
       .selectFrom('ledger_transactions')
       .selectAll()
-      .select(sql<string>`created_at::text`.as('cursor_created_at'))
+      .select(
+        sql<string>`((extract(epoch from created_at) * 1000000)::bigint)::text`
+          .as('cursor_created_at_micros'),
+      )
       .where('user_id', '=', userId);
 
     if (decodedCursor) {
-      const cursorTimestamp = sql<Date>`${decodedCursor.createdAt}::timestamptz`;
+      const cursorMicros = BigInt(decodedCursor.createdAtMicros);
+      const cursorSeconds = (cursorMicros / 1_000_000n).toString();
+      const microsRemainder = (cursorMicros % 1_000_000n).toString();
+      const cursorTimestamp = sql<Date>`
+        timestamptz 'epoch'
+        + ${cursorSeconds}::bigint * interval '1 second'
+        + ${microsRemainder}::integer * interval '1 microsecond'
+      `;
       query = query.where(({ and, eb, or }) => or([
         eb('created_at', '<', cursorTimestamp),
         and([
@@ -179,13 +197,16 @@ export class LedgerService {
     return {
       items,
       nextCursor: hasNextPage && last
-        ? encodeCursor({ createdAt: last.cursor_created_at, id: last.id })
+        ? encodeCursor({
+            createdAtMicros: last.cursor_created_at_micros,
+            id: last.id,
+          })
         : null,
     };
   }
 
   private async insert(
-    input: PostLedgerInput,
+    input: InternalPostLedgerInput,
     reversalOf: string | null,
     trx: Transaction<Database>,
   ): Promise<LedgerTransaction> {
@@ -194,9 +215,12 @@ export class LedgerService {
     }
 
     const accountIds = input.postings.map(({ accountId }) => accountId);
-    const ownedAccountIds = await this.accounts.findOwnedIds(input.userId, accountIds, trx);
-    if (ownedAccountIds.length !== new Set(accountIds).size) {
+    const ownedAccounts = await this.accounts.findByIds(input.userId, accountIds, trx);
+    if (ownedAccounts.length !== new Set(accountIds).size) {
       throw new NotFoundException('Financial account not found');
+    }
+    if (input.type === 'OPENING_BALANCE') {
+      validateOpeningBalanceShape(input, ownedAccounts);
     }
 
     const transactionId = randomUUID();
@@ -302,10 +326,13 @@ export class LedgerService {
 }
 
 function validatePostInput(input: PostLedgerInput): void {
-  if (!(LEDGER_TRANSACTION_TYPES as readonly string[]).includes(input.type)) {
+  if (!(POST_LEDGER_TRANSACTION_TYPES as readonly string[]).includes(input.type)) {
     throw new BadRequestException('Invalid ledger transaction type');
   }
   validateDate(input.effectiveAt);
+  if (input.type === 'OPENING_BALANCE' && input.postings.length !== 2) {
+    throw new BadRequestException('Opening balance requires exactly two postings');
+  }
   if (input.postings.length < 2) {
     throw new BadRequestException('A ledger transaction requires at least two postings');
   }
@@ -319,6 +346,27 @@ function validatePostInput(input: PostLedgerInput): void {
     throw new BadRequestException('Ledger postings must sum to zero');
   }
   toJsonObject(input.metadata ?? {});
+}
+
+function validateOpeningBalanceShape(
+  input: InternalPostLedgerInput,
+  accounts: ReadonlyArray<{ id: string; kind: string }>,
+): void {
+  const kindById = new Map(accounts.map(({ id, kind }) => [id, kind]));
+  const openingEquityPosting = input.postings.find(
+    ({ accountId }) => kindById.get(accountId) === 'OPENING_EQUITY',
+  );
+  const freePosting = input.postings.find(
+    ({ accountId }) => kindById.get(accountId) === 'FREE',
+  );
+  if (!openingEquityPosting || !freePosting
+    || openingEquityPosting.amountMinor >= 0
+    || freePosting.amountMinor <= 0
+    || -openingEquityPosting.amountMinor !== freePosting.amountMinor) {
+    throw new BadRequestException(
+      'Opening balance must debit OPENING_EQUITY and credit FREE by the same amount',
+    );
+  }
 }
 
 function validatePositiveMoney(value: number): void {
@@ -371,23 +419,35 @@ function toPosting(row: PostingRow): LedgerPosting {
 
 function encodeCursor(cursor: LedgerCursor): string {
   return Buffer.from(JSON.stringify({
-    createdAt: cursor.createdAt,
+    createdAtMicros: cursor.createdAtMicros,
     id: cursor.id,
   })).toString('base64url');
 }
 
 function decodeCursor(cursor: string): LedgerCursor {
   try {
+    if (!BASE64URL_PATTERN.test(cursor)) {
+      throw new Error('Invalid base64url');
+    }
     const decoded = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as {
-      createdAt?: unknown;
+      createdAtMicros?: unknown;
       id?: unknown;
     };
-    const createdAt = typeof decoded.createdAt === 'string' ? decoded.createdAt : '';
-    if (Number.isNaN(new Date(createdAt).getTime()) || typeof decoded.id !== 'string'
+    if (typeof decoded.createdAtMicros !== 'string'
+      || !CURSOR_MICROS_PATTERN.test(decoded.createdAtMicros)
+      || BigInt(decoded.createdAtMicros) > MAX_CURSOR_MICROS
+      || typeof decoded.id !== 'string'
       || !UUID_PATTERN.test(decoded.id)) {
       throw new Error('Invalid cursor payload');
     }
-    return { createdAt, id: decoded.id };
+    const canonical: LedgerCursor = {
+      createdAtMicros: decoded.createdAtMicros,
+      id: decoded.id,
+    };
+    if (encodeCursor(canonical) !== cursor) {
+      throw new Error('Non-canonical cursor');
+    }
+    return canonical;
   } catch {
     throw new BadRequestException('Invalid ledger cursor');
   }

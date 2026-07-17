@@ -1,4 +1,4 @@
-export const LEDGER_TRANSACTION_TYPES = [
+export const POST_LEDGER_TRANSACTION_TYPES = [
   'OPENING_BALANCE',
   'INCOME',
   'ORDINARY_EXPENSE',
@@ -9,10 +9,15 @@ export const LEDGER_TRANSACTION_TYPES = [
   'BUDGET_RELEASE',
   'SAVINGS_TRANSFER',
   'SETTLEMENT_TRANSFER',
+] as const;
+
+export const LEDGER_TRANSACTION_TYPES = [
+  ...POST_LEDGER_TRANSACTION_TYPES,
   'REVERSAL',
 ] as const;
 
 export type LedgerTransactionType = (typeof LEDGER_TRANSACTION_TYPES)[number];
+export type PostLedgerTransactionType = (typeof POST_LEDGER_TRANSACTION_TYPES)[number];
 
 export interface LedgerPostingInput {
   accountId: string;
@@ -21,7 +26,7 @@ export interface LedgerPostingInput {
 
 export interface PostLedgerInput {
   userId: string;
-  type: LedgerTransactionType;
+  type: PostLedgerTransactionType;
   effectiveAt: Date;
   postings: ReadonlyArray<LedgerPostingInput>;
   metadata?: Record<string, unknown>;
