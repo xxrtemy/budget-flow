@@ -693,7 +693,7 @@ function database(): Kysely<Database> {
 }
 
 function budgetService(): BudgetService {
-  return new BudgetService(database());
+  return new BudgetService(database(), undefined, () => NOW);
 }
 
 async function createUserWithOpeningBalance(amountMinor: number): Promise<string> {

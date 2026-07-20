@@ -16,6 +16,7 @@ import type {
   ScheduleCadence,
 } from '../../database/database.types';
 import { assertMoneyMinor } from '../domain/money';
+import type { FinanceClock } from '../finance.constants';
 import { FinanceTransactionContext } from '../transaction/finance-transaction-context';
 import { AccountRepository } from '../ledger/account.repository';
 import { LedgerService } from '../ledger/ledger.service';
@@ -81,6 +82,7 @@ export class BudgetService {
   constructor(
     @Inject(DATABASE) private readonly db: Kysely<Database>,
     @Optional() transactions?: FinanceTransactionContext,
+    private readonly clock: FinanceClock = () => new Date(),
   ) {
     this.ledger = new LedgerService(db);
     this.accounts = new AccountRepository(db);
@@ -91,6 +93,8 @@ export class BudgetService {
     validateAmount(input.amountMinor);
     validateLocalDate(input.startsOn);
     validateCadence(input.cadence);
+    const now = this.clock();
+    validateDate(now, 'now');
 
     return this.transactions.inTransaction(this.db, async (trx) => {
       const profile = await trx.selectFrom('financial_profiles').select('user_id')
@@ -107,6 +111,8 @@ export class BudgetService {
         starts_on: input.startsOn,
         cadence: input.cadence,
         archived_at: null,
+        created_at: now,
+        updated_at: now,
       }).returningAll().executeTakeFirstOrThrow();
       await trx.insertInto('financial_accounts').values({
         id: reserveAccountId,

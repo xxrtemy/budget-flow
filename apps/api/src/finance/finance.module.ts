@@ -45,12 +45,17 @@ import { FinanceTransactionContext } from './transaction/finance-transaction-con
     { provide: FINANCE_CLOCK, useFactory: (): FinanceClock => () => new Date() },
     FinanceTransactionContext,
     LedgerService,
-    BudgetService,
     CategoryService,
     ExpenseService,
     SavingsService,
     SettlementService,
     { provide: PERIOD_CLOSER, useExisting: SettlementService },
+    {
+      provide: BudgetService,
+      inject: [DATABASE, FINANCE_CLOCK, FinanceTransactionContext],
+      useFactory: (db: Kysely<Database>, clock: FinanceClock,
+        transactions: FinanceTransactionContext) => new BudgetService(db, transactions, clock),
+    },
     {
       provide: ProfileService,
       inject: [DATABASE, FINANCE_CLOCK],
