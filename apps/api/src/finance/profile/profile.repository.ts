@@ -80,15 +80,17 @@ export class ProfileRepository {
 
       await transaction
         .insertInto('financial_accounts')
-        .values(SYSTEM_ACCOUNT_KINDS.map((kind) => ({
-          id: randomUUID(),
-          user_id: data.userId,
-          kind,
-          reference_id: null,
-          name: null,
-          target_amount_minor: null,
-          archived_at: null,
-        })))
+        .values(
+          SYSTEM_ACCOUNT_KINDS.map((kind) => ({
+            id: randomUUID(),
+            user_id: data.userId,
+            kind,
+            reference_id: null,
+            name: null,
+            target_amount_minor: null,
+            archived_at: null,
+          })),
+        )
         .execute();
 
       await transaction
