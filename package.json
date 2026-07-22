@@ -10,7 +10,11 @@
   "scripts": {
     "build": "turbo run build",
     "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
     "check": "turbo run build typecheck",
-    "dev": "turbo run dev"
+    "dev": "turbo run dev",
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose down",
+    "db:migrate": "pnpm --filter @budget-flow/api migrate"
   }
 }
